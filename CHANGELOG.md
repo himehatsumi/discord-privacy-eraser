@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## 1.3.1 — 2026-07-24
+
+- Made the no-filter default mean every message authored by the authenticated account, including pinned and edited messages.
+- Started a new preferences generation so the new explicit delete-everything default is not overridden by older saved UI defaults.
+- Preserved the exact settings and scope of interrupted run checkpoints during the preferences change.
+- Split batch reporting into combined history scanned, authored by your account, passed filters, queued, and remaining counts.
+- Clarified that each 500-message batch contains combined channel/DM history and that older history is scanned only after the first queue is confirmed.
+- Added the authenticated username and “older history not scanned yet” to the batch-ready log.
+- Made author-ID comparison robust to string-like API values and added regression coverage for pinned and edited messages under the default scope.
+
 ## 1.3.0 — 2026-07-24
 
 - Changed long-history processing to scan 500 raw history messages, delete that batch's reviewed matches, and repeat.

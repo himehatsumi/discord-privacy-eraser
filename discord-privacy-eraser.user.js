@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.3.0
+// @version      1.3.1
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -35,8 +35,9 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.3.0',
-    prefsKey: 'dpe:prefs:v1',
+    version: '1.3.1',
+    prefsKey: 'dpe:prefs:v2',
+    legacyPrefsKeys: ['dpe:prefs:v1'],
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
     maxLogLines: 180,
@@ -102,7 +103,7 @@
     excludeTerms: '',
     attachmentMode: 'any',
     linkMode: 'any',
-    includePinned: false,
+    includePinned: true,
     includeEdited: true,
     minMessageAgeHours: 0,
     maxMessages: 0,
@@ -341,6 +342,9 @@
     // userscript storage failed. Remove only this script's old namespaced keys.
     try {
       pageWindow.localStorage?.removeItem(SCRIPT.prefsKey);
+      for (const key of SCRIPT.legacyPrefsKeys) {
+        pageWindow.localStorage?.removeItem(key);
+      }
       pageWindow.localStorage?.removeItem(SCRIPT.runKey);
     } catch {}
   }
@@ -373,6 +377,8 @@
       historyComplete: false,
       batchNumber: 1,
       batchScannedMessages: 0,
+      batchOwnedMessages: 0,
+      batchFilterMatches: 0,
       batchProcessed: 0,
       scannedPages: 0,
       scannedMessages: 0,
@@ -938,7 +944,10 @@
     excludedTerms,
     referenceTime = Date.now(),
   ) {
-    if (!message?.author?.id || message.author.id !== currentUser.id) return false;
+    if (
+      !message?.author?.id
+      || String(message.author.id) !== String(currentUser?.id || '')
+    ) return false;
     if (!config.includePinned && message.pinned) return false;
     if (!config.includeEdited && message.edited_timestamp) return false;
 
@@ -995,6 +1004,22 @@
       .filter(Boolean)
       .map((term) => (config.caseSensitive ? term : term.toLocaleLowerCase()));
     return { compiledRegex, excludedTerms };
+  }
+
+  function isDeleteEverythingConfig(config) {
+    return Boolean(
+      config
+      && !config.afterDate
+      && !config.beforeDate
+      && !config.text
+      && !config.excludeTerms.trim()
+      && config.attachmentMode === 'any'
+      && config.linkMode === 'any'
+      && config.includePinned
+      && config.includeEdited
+      && config.minMessageAgeHours === 0
+      && config.maxMessages === 0
+    );
   }
 
   function validateConfig(config) {
@@ -1314,6 +1339,8 @@
         runState.operation = 'scanning';
         runState.batchNumber += 1;
         runState.batchScannedMessages = 0;
+        runState.batchOwnedMessages = 0;
+        runState.batchFilterMatches = 0;
         runState.batchProcessed = 0;
         runState.initialMatches = 0;
         runState.matchedMessages = 0;
@@ -1340,6 +1367,12 @@
         'info',
         `Dry run started for ${formatTarget(target)}. No messages will be deleted during scanning.`,
       );
+      log(
+        'info',
+        isDeleteEverythingConfig(config)
+          ? 'Default delete-everything scope is active: every message authored by your authenticated account is eligible, including pinned and edited messages.'
+          : 'Custom filters are active. Ownership and filter-pass counts will be reported separately.',
+      );
 
       while (!reachedDateFloor) {
         // A reload can occur after the boundary page was checkpointed but before
@@ -1352,9 +1385,14 @@
           break;
         }
         if (runState.batchScannedMessages >= config.scanBatchSize) {
-          log('info', `Batch ${runState.batchNumber} had no matches; continuing to the next ${config.scanBatchSize.toLocaleString()} history messages.`);
+          log(
+            'info',
+            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} combined messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
+          );
           runState.batchNumber += 1;
           runState.batchScannedMessages = 0;
+          runState.batchOwnedMessages = 0;
+          runState.batchFilterMatches = 0;
         }
         await controlPoint();
         const remainingInBatch = Math.max(
@@ -1398,6 +1436,9 @@
         runState.batchScannedMessages += messages.length;
 
         for (const message of messages) {
+          if (String(message?.author?.id || '') === String(runState.userId)) {
+            runState.batchOwnedMessages += 1;
+          }
           if (matchesMessage(
             message,
             config,
@@ -1405,6 +1446,7 @@
             excludedTerms,
             runState.filterReferenceTime,
           )) {
+            runState.batchFilterMatches += 1;
             runState.queue.push({
               id: String(message.id),
               channelId: String(target.channelId),
@@ -1443,7 +1485,7 @@
         else updateUi();
         log(
           'info',
-          `Scanned ${runState.scannedMessages.toLocaleString()} messages; ${runState.matchedMessages.toLocaleString()} match so far.`,
+          `Scanned ${runState.scannedMessages.toLocaleString()} combined messages total; batch ${runState.batchNumber}: ${runState.batchOwnedMessages.toLocaleString()} authored by your account, ${runState.batchFilterMatches.toLocaleString()} passed filters.`,
         );
 
         if (reachedDateFloor) break;
@@ -1454,9 +1496,14 @@
           break;
         }
         if (runState.batchScannedMessages >= config.scanBatchSize) {
-          log('info', `Batch ${runState.batchNumber} had no matches; continuing to the next ${config.scanBatchSize.toLocaleString()} history messages.`);
+          log(
+            'info',
+            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} combined messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
+          );
           runState.batchNumber += 1;
           runState.batchScannedMessages = 0;
+          runState.batchOwnedMessages = 0;
+          runState.batchFilterMatches = 0;
         }
         await interruptibleSleep(jitter(config.scanDelayMs, config.jitterPercent));
       }
@@ -1481,9 +1528,10 @@
       }
       saveRunState();
       if (runState.queue.length > 0) {
+        const accountLabel = user.username ? `@${user.username}` : `account ${user.id}`;
         log(
           'success',
-          `Batch ${runState.batchNumber} ready: ${runState.queue.length.toLocaleString()} of your messages are queued from ${runState.batchScannedMessages.toLocaleString()} history messages.`,
+          `Batch ${runState.batchNumber} ready: ${runState.batchScannedMessages.toLocaleString()} combined channel messages scanned; ${runState.batchOwnedMessages.toLocaleString()} authored by ${accountLabel}; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. Older history has not been scanned yet.`,
         );
       } else {
         log('success', 'History scan complete: no additional matching messages remain.');
@@ -1526,7 +1574,7 @@
       ].join('\n'),
       '',
     );
-    return entered === phrase;
+    return typeof entered === 'string' && entered.trim() === phrase;
   }
 
   function nextDeleteDelay(config) {
@@ -1921,6 +1969,8 @@
     runState.failures = [];
     runState.initialMatches = runState.queue.length;
     runState.matchedMessages = runState.queue.length;
+    runState.batchOwnedMessages = runState.queue.length;
+    runState.batchFilterMatches = runState.queue.length;
     runState.failed = 0;
     runState.batchProcessed = 0;
     runState.historyComplete = true;
@@ -1982,6 +2032,8 @@
     setText('dpe-status', runtime.paused ? 'paused' : runState.status);
     setText('dpe-batch', runState.batchNumber.toLocaleString());
     setText('dpe-scanned', runState.scannedMessages.toLocaleString());
+    setText('dpe-owned', runState.batchOwnedMessages.toLocaleString());
+    setText('dpe-filtered', runState.batchFilterMatches.toLocaleString());
     setText('dpe-matched', runState.initialMatches.toLocaleString());
     setText('dpe-remaining', runState.queue.length.toLocaleString());
     setText('dpe-deleted', runState.deleted.toLocaleString());
@@ -2005,6 +2057,12 @@
     const savedOperation = Boolean(runState.operation && runState.target);
     const sameLockedTarget = sameTarget(target, runState.target);
     const prefs = readConfigFromUi();
+    setText(
+      'dpe-scope-note',
+      isDeleteEverythingConfig(prefs)
+        ? 'Default scope: delete every message authored by your account, including pinned and edited messages.'
+        : 'Custom scope active: one or more filters or preservation limits will exclude messages.',
+    );
     const liveSignature = currentUser?.id && target
       ? configSignature(prefs, target, currentUser.id)
       : '';
@@ -2192,7 +2250,7 @@
         input[type="checkbox"] { margin-top: 2px; accent-color: #5865f2; }
         .hint { color: #949ba4; font-size: 11px; margin-top: 4px; }
         .summary {
-          display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 10px 0;
+          display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin: 10px 0;
         }
         .metric { padding: 8px; border-radius: 7px; background: #2b2d31; }
         .metric b { display: block; color: #f2f3f5; font-size: 15px; }
@@ -2283,7 +2341,7 @@
                     <option value="without">Only without links</option>
                   </select>
                 </label>
-                <label class="check"><input id="dpe-pinned" type="checkbox"> Include pinned messages (off by default)</label>
+                <label class="check"><input id="dpe-pinned" type="checkbox"> Include pinned messages</label>
                 <label class="check"><input id="dpe-edited" type="checkbox"> Include edited messages</label>
                 <label class="field">
                   <span>Protect messages newer than (hours)</span>
@@ -2301,6 +2359,7 @@
                   </select>
                 </label>
               </div>
+              <p id="dpe-scope-note" class="hint">Default scope: delete every message authored by your account, including pinned and edited messages.</p>
             </details>
 
             <details>
@@ -2324,8 +2383,10 @@
           </form>
 
           <div class="summary">
-            <div class="metric"><b id="dpe-scanned">0</b><span>Scanned</span></div>
-            <div class="metric"><b id="dpe-matched">0</b><span>Dry-run match</span></div>
+            <div class="metric"><b id="dpe-scanned">0</b><span>History total</span></div>
+            <div class="metric"><b id="dpe-owned">0</b><span>Yours / batch</span></div>
+            <div class="metric"><b id="dpe-filtered">0</b><span>Pass filters</span></div>
+            <div class="metric"><b id="dpe-matched">0</b><span>Queued batch</span></div>
             <div class="metric"><b id="dpe-remaining">0</b><span>Remaining</span></div>
             <div class="metric"><b id="dpe-deleted">0</b><span>Deleted</span></div>
             <div class="metric"><b id="dpe-failed">0</b><span>Failed</span></div>
@@ -2334,6 +2395,7 @@
           <div class="range">Current batch: <span id="dpe-batch">1</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
           <div class="progress"><div id="dpe-progress-bar"></div></div>
           <div class="hint">Processed: <span id="dpe-progress-text">0%</span></div>
+          <div class="hint">Batch size counts combined messages from everyone. Only messages authored by the authenticated account can be queued.</div>
 
           <div class="actions">
             <button id="dpe-scan" class="primary" type="button">1. Dry run / scan</button>

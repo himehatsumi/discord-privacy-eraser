@@ -15,6 +15,7 @@ const exportBlock = `
     getRunState: () => runState,
     getRuntime: () => runtime,
     isolatePanelEvents,
+    isDeleteEverythingConfig,
     markShadowHostAsTextEntry,
     matchesMessage,
     prepareQueue,
@@ -123,7 +124,7 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     excludeTerms: '',
     attachmentMode: 'any',
     linkMode: 'any',
-    includePinned: false,
+    includePinned: true,
     includeEdited: true,
     minMessageAgeHours: 0,
     maxMessages: 0,
@@ -143,8 +144,8 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     riskAccepted: true,
     ...prefsOverride,
   };
-  if (!stored.has('dpe:prefs:v1')) {
-    stored.set('dpe:prefs:v1', JSON.stringify(prefs));
+  if (!stored.has('dpe:prefs:v2')) {
+    stored.set('dpe:prefs:v2', JSON.stringify(prefs));
   }
 
   const context = {
@@ -290,7 +291,11 @@ async function testApiAllowlistBindsMethodPathAndBody() {
 }
 
 async function testCappedScanAndDelete() {
-  const harness = makeHarness({ maxMessages: 1, deleteOrder: 'oldest' });
+  const harness = makeHarness({
+    maxMessages: 1,
+    deleteOrder: 'oldest',
+    includePinned: false,
+  });
   const newest = '2026-07-03T12:00:00.000Z';
   const middle = '2026-07-02T12:00:00.000Z';
   const oldest = '2026-07-01T12:00:00.000Z';
@@ -517,11 +522,16 @@ async function testContinuousFiveHundredMessageBatches() {
   const ownIds = new Set(['700', '600', '500', '400', '300', '200']);
   const page = (high) => Array.from({ length: 100 }, (_, index) => {
     const id = String(high - index);
-    return message({
+    const item = message({
       id,
       author: ownIds.has(id) ? USER_A : USER_B,
       timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
     });
+    if (id === '700') {
+      item.pinned = true;
+      item.edited_timestamp = '2026-01-01T01:00:00.000Z';
+    }
+    return item;
   });
   const pages = new Map([
     ['', page(700)],
@@ -553,6 +563,8 @@ async function testContinuousFiveHundredMessageBatches() {
   assert.equal(state.status, 'scanned');
   assert.equal(state.scannedMessages, 500);
   assert.equal(state.historyComplete, false);
+  assert.equal(state.batchOwnedMessages, 5);
+  assert.equal(state.batchFilterMatches, 5);
   assert.deepEqual(
     Array.from(state.queue, (item) => item.id),
     ['300', '400', '500', '600', '700'],
@@ -865,6 +877,20 @@ function testFilterMatrix() {
   };
 
   assert.equal(matches(base), true);
+  assert.equal(harness.test.isDeleteEverythingConfig(base), true);
+  assert.equal(
+    matchesMessageForConfig(harness, {
+      ...candidate,
+      pinned: true,
+      edited_timestamp: '2026-07-01T12:30:00.000Z',
+    }, base),
+    true,
+    'the default no-filter scope must include pinned and edited messages',
+  );
+  assert.equal(
+    harness.test.isDeleteEverythingConfig({ ...base, includePinned: false }),
+    false,
+  );
   assert.equal(matches({ ...base, text: 'private photo' }), true);
   assert.equal(matches({ ...base, text: '^Private\\s+Photo', regex: true }), true);
   assert.equal(matches({ ...base, text: '^private', regex: true, caseSensitive: true }), false);
@@ -904,6 +930,16 @@ function testFilterMatrix() {
     ),
     true,
     'age filtering should use the dry-run reference time instead of wall-clock drift',
+  );
+}
+
+function matchesMessageForConfig(harness, candidate, config) {
+  const compiled = harness.test.compileFilters(config);
+  return harness.test.matchesMessage(
+    candidate,
+    config,
+    compiled.compiledRegex,
+    compiled.excludedTerms,
   );
 }
 
