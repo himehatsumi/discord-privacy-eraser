@@ -16,6 +16,7 @@ All notable changes are documented here.
 - Kept message text out of preferences, checkpoints, files, clipboard operations, and third-party requests.
 - Added regression coverage for a first 500-message window with only one owned message, exact owned-message boundary cursors, and complete matched-message log output.
 - Refreshed installation, upgrade, privacy, security, and release documentation and added a packaged userscript asset to the current GitHub release.
+- Updated repository validation to the Node 24-based GitHub Actions v6 runtime, disabled unused package-manager caching and checkout credentials, and added concurrency cancellation plus manual dispatch.
 
 ## 1.4.0 — 2026-07-24
 
