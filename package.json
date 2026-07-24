@@ -1,0 +1,16 @@
+{
+  "name": "discord-privacy-eraser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A safety-focused userscript for deleting only your own messages in the current Discord channel or DM.",
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check discord-privacy-eraser.user.js",
+    "test:smoke": "node tests/smoke-test.cjs",
+    "test:security": "node tests/security-check.cjs",
+    "test": "npm run check && npm run test:smoke && npm run test:security"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
