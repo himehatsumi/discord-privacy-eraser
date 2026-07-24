@@ -37,6 +37,8 @@ After that one confirmation, the script deletes the reviewed matches, collects t
 
 Every filter match in the current batch appears in the matched-message log. Its detail can be set to full text, a 300-character preview, timestamp/ID only, or off. The default is full text. This log exists only in the current page memory: message content is never written into the checkpoint, browser storage, a file, or a network request.
 
+Version 1.5.1 adds a separate **Diagnostics for bug reports** log. It records the search response shape, hashed cursors and identities, page timestamps, anonymized author counts, message types, missing-author counts, pagination transitions, and rate-limit headers. It never includes message text, usernames, raw Discord IDs, credentials, or tokens. If at most one owned message is recognized after 500 anchored history messages, the activity log tells you the diagnostic trace is ready. Stop the scan, click **Copy diagnostics**, and paste the complete block into the bug report. The trace stays in page memory and is copied only when you explicitly press that button.
+
 The default anchor lookup is equivalent to searching the locked channel for messages from the authenticated account, sorted newest first. The returned hit must have the exact `/users/@me` author ID and current channel ID. If Discord search is unavailable, still indexing, or returns an invalid result, the script self-corrects by falling back to direct newest-to-oldest history. That fallback has no fixed timer: it requests the next page as soon as the previous one completes while still obeying live rate-limit headers and HTTP 429 `Retry-After`. Post-anchor batch scanning defaults to 250 ms between pages and remains configurable.
 
 For a very long history, leave the tab open. Pausing or stopping preserves the exact seek/scan/delete checkpoint. Transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
@@ -58,6 +60,7 @@ For a very long history, leave the tab open. Pausing or stopping preserves the e
 - A rolling invalid-request circuit breaker pauses before mixed 401/403/429 responses can accumulate unchecked.
 - The Discord authorization token is held only in memory and never shown, logged, copied, exported, or persisted.
 - Checkpoints store only settings, target/message IDs, timestamps, and counters in userscript-manager storage.
+- Bug-report diagnostics are memory-only, hash all Discord IDs, omit content and usernames, and require an explicit copy action.
 
 ## What the filters mean
 
@@ -110,7 +113,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
-- Mocked end-to-end scans and deletions covering the one-request author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, the regression where the first 500 combined messages contain only one owned message, exact mid-page owned boundaries, complete memory-only match logs, no-progress loop guards, panel input isolation, filters, short/empty/out-of-order pages, bounded queues, migrated checkpoints, account changes, preflight failure, persisted cooldowns, mixed invalid responses, HTTP 401, and HTTP 429 recovery.
+- Mocked end-to-end scans and deletions covering the one-request author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, the regression where the first 500 combined messages contain only one owned message, redacted diagnostic export, exact mid-page owned boundaries, complete memory-only match logs, no-progress loop guards, panel input isolation, filters, short/empty/out-of-order pages, bounded queues, migrated checkpoints, account changes, preflight failure, persisted cooldowns, mixed invalid responses, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 - Release-consistency checks that keep the package, userscript metadata, runtime version, changelog, and README release links aligned.
 

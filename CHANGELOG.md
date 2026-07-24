@@ -2,6 +2,14 @@
 
 All notable changes are documented here.
 
+## [1.5.1](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.5.1) — 2026-07-24
+
+- Added a separate memory-only diagnostics log for investigating incorrect ownership counts without exposing message text, usernames, raw account/channel/message IDs, credentials, or tokens.
+- Added one-click diagnostic copying with userscript-manager clipboard support plus browser and manual-copy fallbacks; diagnostics leave the page only after an explicit click.
+- Recorded the search response shape, selected anchor, API version, hashed identity/target/cursor values, per-page time range, anonymized author distribution, message types, missing authors, webhook count, pagination transitions, rate-limit headers, and final scan counters.
+- Added a prominent warning when at most one owned message is recognized after 500 anchored history messages, so the affected scan can be stopped and reported without traversing the full conversation.
+- Added regression coverage proving the sparse-history trace is complete while excluding message content and raw Discord IDs from the diagnostic export.
+
 ## [1.5.0](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.5.0) — 2026-07-24
 
 - Changed fresh-run batch capacity from combined channel history to messages authored by the authenticated account: the default batch now collects 500 of your messages before deletion.

@@ -32,6 +32,7 @@ Changes should be rejected if they introduce any of the following without an exp
 - Counting or queueing any message newer than the authenticated account's discovered latest-message anchor in a fresh run.
 - Counting a message toward the owned-message batch boundary unless its author ID equals the locked `/users/@me` identity.
 - Persisting matched-message log content in preferences, checkpoints, page storage, files, the clipboard, or network requests.
+- Including message content, usernames, raw Discord IDs, credentials, or tokens in the diagnostic log, or copying diagnostics without an explicit user action.
 - Removal of queue-integrity, strict history-ordering, or invalid-request circuit checks.
 - Removing the batch no-progress guard or allowing a fresh run to cross its exact owned-message boundary without preserving the next older cursor.
 - Retrying HTTP 429 before Discord's `Retry-After` period has elapsed.

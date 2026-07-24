@@ -66,6 +66,12 @@ During a live scan, the panel can display every filter match in the current batc
 
 Those entries exist only in the userscript's current JavaScript memory and the panel's shadow DOM. They are cleared when the page is reloaded, the next batch starts, or the log is cleared. They are never included in preferences or checkpoints, written to a file or clipboard, or transmitted anywhere. After a reload, an interrupted checkpoint can resume safely, but message text found before the reload is intentionally not reconstructed or persisted.
 
+## Memory-only diagnostic log
+
+Version 1.5.1 can create a separate technical trace for investigating incorrect ownership or pagination counts. It contains response counts and status, timestamps, hashed account/channel/message/cursor IDs, anonymized per-page author distributions, message-type counts, missing-author and webhook counts, pagination transitions, active filter categories, API version, rate-limit headers, and final counters.
+
+It deliberately omits message content, usernames, raw Discord IDs, authorization data, cookies, and request headers. The trace is not added to preferences or checkpoints and disappears on reload. It is placed on the clipboard only after the user explicitly clicks **Copy diagnostics**; that copy is intended to be pasted into a private bug report.
+
 Use **Clear checkpoint** in the panel to erase saved run data. Removing the userscript through the userscript manager may also provide an option to remove its stored values.
 
 ## Security boundary

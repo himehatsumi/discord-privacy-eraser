@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.5.0
+// @version      1.5.1
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -13,6 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_setClipboard
 // ==/UserScript==
 
 (() => {
@@ -35,12 +36,13 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.5.0',
+    version: '1.5.1',
     prefsKey: 'dpe:prefs:v4',
     legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3'],
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
     maxLogLines: 180,
+    maxDebugLines: 2000,
     maxSavedFailures: 2000,
     invalidRequestWindowMs: 10 * 60 * 1000,
   });
@@ -78,6 +80,9 @@
     batchLoop: false,
     logs: [],
     matchLogs: [],
+    debugLogs: [],
+    debugEventCount: 0,
+    suspiciousOwnershipWarningShown: false,
   };
 
   class StopSignal extends Error {
@@ -627,10 +632,15 @@
     return Math.max(0, Math.round(ms + ((Math.random() * 2 - 1) * spread)));
   }
 
-  function log(level, message) {
-    const safeMessage = String(message)
+  function redactSecrets(value) {
+    return String(value)
       .replace(/mfa\.[\w-]+/gi, '[redacted token]')
-      .replace(/[\w-]{20,}\.[\w-]{4,}\.[\w-]{20,}/g, '[redacted token]');
+      .replace(/[\w-]{20,}\.[\w-]{4,}\.[\w-]{20,}/g, '[redacted token]')
+      .replace(/(authorization|token)\s*[:=]\s*[^\s,}\]]+/gi, '$1=[redacted]');
+  }
+
+  function log(level, message) {
+    const safeMessage = redactSecrets(message);
     runtime.logs.push({
       at: new Date().toLocaleTimeString(),
       level,
@@ -638,6 +648,120 @@
     });
     if (runtime.logs.length > SCRIPT.maxLogLines) runtime.logs.shift();
     updateLog();
+  }
+
+  function debugId(value) {
+    const text = String(value || '');
+    return text ? `id#${fnv1a(text)}:${text.length}d` : 'missing';
+  }
+
+  function safeDebugValue(value, depth = 0) {
+    if (value === null || value === undefined) return value ?? null;
+    if (typeof value === 'boolean' || typeof value === 'number') return value;
+    if (typeof value === 'string') return redactSecrets(value).slice(0, 500);
+    if (depth >= 3) return '[depth limited]';
+    if (Array.isArray(value)) {
+      return value.slice(0, 40).map((item) => safeDebugValue(item, depth + 1));
+    }
+    if (typeof value === 'object') {
+      const output = {};
+      for (const [key, item] of Object.entries(value).slice(0, 60)) {
+        output[String(key).slice(0, 80)] = safeDebugValue(item, depth + 1);
+      }
+      return output;
+    }
+    return String(value).slice(0, 100);
+  }
+
+  function debugLog(event, details = {}) {
+    const entry = {
+      at: new Date().toISOString(),
+      event: String(event || 'unknown').slice(0, 80),
+      ...safeDebugValue(details),
+    };
+    runtime.debugLogs.push(JSON.stringify(entry));
+    runtime.debugEventCount += 1;
+    if (runtime.debugLogs.length > SCRIPT.maxDebugLines) runtime.debugLogs.shift();
+    if (
+      runtime.debugEventCount <= 5
+      || runtime.debugEventCount % 10 === 0
+      || ['suspicious-ownership-count', 'scan-finished', 'scan-error'].includes(entry.event)
+    ) {
+      updateDebugLog();
+    }
+  }
+
+  function authorPageDiagnostics(messages, userId) {
+    const authors = new Map();
+    const types = new Map();
+    let missingAuthor = 0;
+    let webhookMessages = 0;
+    let owned = 0;
+
+    for (const message of messages) {
+      const type = String(message?.type ?? 'missing');
+      types.set(type, (types.get(type) || 0) + 1);
+      if (message?.webhook_id) webhookMessages += 1;
+      const authorId = String(message?.author?.id || '');
+      if (!authorId) {
+        missingAuthor += 1;
+        continue;
+      }
+      const label = authorId === String(userId || '') ? 'self' : debugId(authorId);
+      authors.set(label, (authors.get(label) || 0) + 1);
+      if (label === 'self') owned += 1;
+    }
+
+    return {
+      owned,
+      missingAuthor,
+      webhookMessages,
+      authors: [...authors.entries()]
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 12)
+        .map(([author, count]) => ({ author, count })),
+      messageTypes: [...types.entries()]
+        .sort((left, right) => right[1] - left[1])
+        .map(([type, count]) => ({ type, count })),
+    };
+  }
+
+  function historyPageDiagnostics(messages, {
+    target,
+    userId,
+    before,
+    pageNumber,
+    anchorFound,
+  }) {
+    const newest = messages[0] || null;
+    const oldest = messages[messages.length - 1] || null;
+    return {
+      page: pageNumber,
+      requestedBefore: debugId(before),
+      responseCount: messages.length,
+      newestMessage: debugId(newest?.id),
+      newestTimestamp: String(newest?.timestamp || ''),
+      oldestMessage: debugId(oldest?.id),
+      oldestTimestamp: String(oldest?.timestamp || ''),
+      targetChannel: debugId(target?.channelId),
+      authenticatedUser: debugId(userId),
+      runtimeUser: debugId(currentUser?.id),
+      identityStillMatches: String(currentUser?.id || '') === String(userId || ''),
+      anchorFound: Boolean(anchorFound),
+      ...authorPageDiagnostics(messages, userId),
+    };
+  }
+
+  function diagnosticExportText() {
+    const header = [
+      'Discord Privacy Eraser diagnostics',
+      `Script version: ${SCRIPT.version}`,
+      `Generated: ${new Date().toISOString()}`,
+      'Privacy: message content, usernames, raw account/channel/message IDs, credentials, and tokens are omitted or hashed.',
+      'Format: one JSON object per line.',
+      '',
+    ];
+    return [...header, ...runtime.debugLogs].join('\n');
   }
 
   function matchLogText(message, mode) {
@@ -656,9 +780,7 @@
       embeds.length ? `${embeds.length} embed${embeds.length === 1 ? '' : 's'}` : '',
     ].filter(Boolean);
     const body = content || (extras.length ? `[${extras.join(', ')}]` : '[empty message]');
-    return `${prefix} · ${body}`
-      .replace(/mfa\.[\w-]+/gi, '[redacted token]')
-      .replace(/[\w-]{20,}\.[\w-]{4,}\.[\w-]{20,}/g, '[redacted token]');
+    return redactSecrets(`${prefix} · ${body}`);
   }
 
   function logMatchedMessage(message, config) {
@@ -881,6 +1003,13 @@
           throw new Error(`${purpose} failed after ${maxRetries} network retries.`);
         }
         const waitMs = Math.min(30000, (2 ** Math.min(transientAttempt, 6)) * 700);
+        debugLog('network-retry', {
+          purpose,
+          attempt: transientAttempt,
+          maxRetries,
+          waitMs,
+          errorName: String(error?.name || 'Error').slice(0, 80),
+        });
         log('warn', `${purpose} hit a network error; retrying in ${formatDuration(waitMs)}.`);
         await interruptibleSleep(jitter(waitMs, 20));
         continue;
@@ -924,6 +1053,14 @@
         runtime.nextAllowedAt = Math.max(runtime.nextAllowedAt, deadline);
         runState.rateLimitUntil = Math.max(runState.rateLimitUntil || 0, deadline);
         const invalidRequests = recordInvalidRequest(429, scope);
+        debugLog('rate-limit', {
+          purpose,
+          scope,
+          advertisedWaitMs: advertisedWait,
+          adaptiveDelayMs: runtime.adaptiveDeleteDelayMs,
+          appliedWaitMs: waitMs,
+          invalidRequestCount: invalidRequests.count,
+        });
         saveRunState();
         if (invalidRequests.tripped) {
           throw invalidRequestCircuitError(invalidRequests.count);
@@ -937,12 +1074,20 @@
         transientAttempt += 1;
         if (transientAttempt > maxRetries) return response;
         const waitMs = Math.min(30000, (2 ** Math.min(transientAttempt, 6)) * 750);
+        debugLog('server-retry', {
+          purpose,
+          status: response.status,
+          attempt: transientAttempt,
+          maxRetries,
+          waitMs,
+        });
         log('warn', `Discord returned ${response.status} for ${purpose}; retrying in ${formatDuration(waitMs)}.`);
         await interruptibleSleep(jitter(waitMs, 20));
         continue;
       }
 
       if (response.status === 401) {
+        debugLog('authentication-rejected', { purpose, status: 401 });
         recordInvalidRequest(401);
         saveRunState();
         authToken = '';
@@ -956,6 +1101,11 @@
 
       if (response.status === 403) {
         const invalidRequests = recordInvalidRequest(403);
+        debugLog('request-forbidden', {
+          purpose,
+          status: 403,
+          invalidRequestCount: invalidRequests.count,
+        });
         saveRunState();
         if (invalidRequests.tripped) {
           throw invalidRequestCircuitError(invalidRequests.count);
@@ -1341,11 +1491,53 @@
     const attempts = Math.max(1, Math.min(config.maxRetries, 3));
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       await controlPoint();
+      debugLog('search-request', {
+        attempt,
+        attempts,
+        targetKind: target.kind,
+        targetChannel: debugId(target.channelId),
+        authenticatedUser: debugId(userId),
+        apiVersion,
+        sort: 'timestamp:desc',
+        offset: 0,
+      });
       const response = await apiRequest(
         `${scope}?${query.toString()}`,
         { purpose: 'latest-message author lookup' },
       );
       const payload = await responseJson(response);
+      const groups = Array.isArray(payload?.messages) ? payload.messages : [];
+      const flattened = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+      const hits = flattened.filter((message) => message?.hit === true);
+      const hitDiagnostics = authorPageDiagnostics(hits, userId);
+      const anchor = response.ok && response.status !== 202
+        ? extractSearchAnchor(payload, target, userId)
+        : null;
+      debugLog('search-response', {
+        attempt,
+        status: response.status,
+        ok: response.ok,
+        totalResults: payload?.total_results !== null
+          && payload?.total_results !== undefined
+          && Number.isFinite(Number(payload.total_results))
+          ? Number(payload.total_results)
+          : null,
+        groupCount: groups.length,
+        groupSizes: groups.slice(0, 20).map((group) => (
+          Array.isArray(group) ? group.length : -1
+        )),
+        flattenedCount: flattened.length,
+        hitCount: hits.length,
+        ownedHitCount: hitDiagnostics.owned,
+        hitAuthors: hitDiagnostics.authors,
+        selectedAnchor: debugId(anchor?.id),
+        selectedTimestamp: String(anchor?.timestamp || ''),
+        selectedChannelMatches: anchor
+          ? String(anchor.channel_id || '') === String(target.channelId)
+          : null,
+        selectedAuthorMatches: anchor ? isAuthoredByUser(anchor, userId) : null,
+        ...authorPageDiagnostics(flattened, userId),
+      });
       if (response.status === 202) {
         const retrySeconds = Number(payload?.retry_after);
         const waitMs = Math.max(
@@ -1366,7 +1558,6 @@
         );
         return null;
       }
-      const anchor = extractSearchAnchor(payload, target, userId);
       if (anchor) return anchor;
       log(
         'warn',
@@ -1511,6 +1702,12 @@
       return;
     }
 
+    if (!resume && !continuation) {
+      runtime.debugLogs = [];
+      runtime.debugEventCount = 0;
+      runtime.suspiciousOwnershipWarningShown = false;
+      updateDebugLog();
+    }
     runtime.mode = 'scanning';
     runtime.paused = false;
     runtime.stopped = false;
@@ -1522,6 +1719,32 @@
 
     try {
       const user = await resolveCurrentUser({ force: true });
+      debugLog('scan-start', {
+        scriptVersion: SCRIPT.version,
+        apiVersion,
+        host: location.hostname,
+        mode: resume ? 'resume' : continuation ? 'continuation' : 'fresh',
+        targetKind: target.kind,
+        targetChannel: debugId(target.channelId),
+        authenticatedUser: debugId(user.id),
+        batchMode: resume || continuation ? runState.batchMode : 'owned',
+        scanBatchSize: config.scanBatchSize,
+        anchorLookupMode: config.anchorLookupMode,
+        scanDelayMs: config.scanDelayMs,
+        filters: {
+          afterDateSet: Boolean(config.afterDate),
+          beforeDateSet: Boolean(config.beforeDate),
+          textSet: Boolean(config.text),
+          regex: config.regex,
+          exclusionTermsSet: Boolean(config.excludeTerms.trim()),
+          attachmentMode: config.attachmentMode,
+          linkMode: config.linkMode,
+          includePinned: config.includePinned,
+          includeEdited: config.includeEdited,
+          minimumAgeSet: config.minMessageAgeHours > 0,
+          maximumDeletionSet: config.maxMessages > 0,
+        },
+      });
       const signature = configSignature(config, target, user.id);
       const canResume = resume
         && runState.operation === 'scanning'
@@ -1618,6 +1841,13 @@
           before = String(searchAnchor.id);
           runState.scanCursor = before;
           recordBatchMessage(searchAnchor, target, config, compiledRegex, excludedTerms);
+          debugLog('search-anchor-accepted', {
+            anchorMessage: debugId(searchAnchor.id),
+            timestamp: String(searchAnchor.timestamp || ''),
+            nextHistoryBefore: debugId(before),
+            batchOwnedAfterAnchor: runState.batchOwnedMessages,
+            batchFilterMatchesAfterAnchor: runState.batchFilterMatches,
+          });
           log(
             'success',
             `Found your actual latest message at ${formatDate(searchAnchor.timestamp)} with the fast author-locked lookup. Batch 1 starts at that message; newer messages from the other participant were never walked page by page.`,
@@ -1674,6 +1904,19 @@
 
         const messages = await response.json();
         const nextBefore = validateHistoryPage(messages, target, before, pageLimit);
+        debugLog('history-page', {
+          status: response.status,
+          requestedLimit: pageLimit,
+          rateLimitRemaining: response.headers.get('X-RateLimit-Remaining'),
+          rateLimitResetAfter: response.headers.get('X-RateLimit-Reset-After'),
+          ...historyPageDiagnostics(messages, {
+            target,
+            userId: runState.userId,
+            before,
+            pageNumber: runState.scannedPages + 1,
+            anchorFound: runState.anchorFound,
+          }),
+        });
         if (messages.length === 0) {
           consecutiveEmptyPages += 1;
           if (consecutiveEmptyPages >= config.emptyPageConfirmations) {
@@ -1738,6 +1981,37 @@
           && batchMessages.length < messages.length - skippedOnPage;
         before = stoppedAtOwnedBoundary ? String(oldest.id) : nextBefore;
         runState.scanCursor = before;
+        debugLog('history-page-processed', {
+          page: runState.scannedPages,
+          processedFromPage: batchMessages.length,
+          skippedBeforeAnchor: skippedOnPage,
+          stoppedAtOwnedBoundary,
+          nextBefore: debugId(before),
+          totalInspected: runState.scannedMessages,
+          batchInspected: runState.batchScannedMessages,
+          batchOwned: runState.batchOwnedMessages,
+          batchFilterMatches: runState.batchFilterMatches,
+        });
+        if (
+          runState.anchorFound
+          && !runtime.suspiciousOwnershipWarningShown
+          && runState.batchScannedMessages >= 500
+          && runState.batchOwnedMessages <= 1
+        ) {
+          runtime.suspiciousOwnershipWarningShown = true;
+          debugLog('suspicious-ownership-count', {
+            reason: 'At most one owned message was recognized after at least 500 anchored history messages.',
+            batchInspected: runState.batchScannedMessages,
+            batchOwned: runState.batchOwnedMessages,
+            authenticatedUser: debugId(runState.userId),
+            runtimeUser: debugId(currentUser?.id),
+            identityStillMatches: String(currentUser?.id || '') === String(runState.userId || ''),
+          });
+          log(
+            'warn',
+            'The ownership count looks suspiciously sparse. A redacted technical trace is ready under “Diagnostics for bug reports”; you can stop the scan and copy it.',
+          );
+        }
         if (config.afterDate) {
           const oldestTimestamp = new Date(oldest.timestamp).getTime();
           if (oldestTimestamp < new Date(config.afterDate).getTime()) {
@@ -1819,7 +2093,31 @@
             : `History scan complete: none of the ${runState.scannedMessages.toLocaleString()} inspected messages were authored by the authenticated account.`,
         );
       }
+      debugLog('scan-finished', {
+        status: runState.status,
+        historyComplete: runState.historyComplete,
+        anchorMethod: runState.anchorMethod,
+        pages: runState.scannedPages,
+        inspected: runState.scannedMessages,
+        batchInspected: runState.batchScannedMessages,
+        batchOwned: runState.batchOwnedMessages,
+        batchFilterMatches: runState.batchFilterMatches,
+        queued: runState.queue.length,
+        scanCursor: debugId(runState.scanCursor),
+      });
     } catch (error) {
+      const errorText = String(error?.message || error || '');
+      debugLog('scan-error', {
+        name: error?.name || 'Error',
+        status: Number.isFinite(error?.status) ? error.status : null,
+        messageFingerprint: fnv1a(errorText),
+        messageLength: errorText.length,
+        preflight: runtime.preflight,
+        pages: runState.scannedPages,
+        inspected: runState.scannedMessages,
+        batchOwned: runState.batchOwnedMessages,
+        scanCursor: debugId(runState.scanCursor),
+      });
       if (error instanceof StopSignal) {
         log('info', 'Scan stopped. Its checkpoint was preserved.');
       } else {
@@ -2319,6 +2617,61 @@
       : 'No matching messages have been found in this batch yet.';
   }
 
+  function updateDebugLog() {
+    if (!shadow) return;
+    const output = shadow.getElementById('dpe-debug-log');
+    const count = shadow.getElementById('dpe-debug-log-count');
+    if (count) count.textContent = runtime.debugLogs.length.toLocaleString();
+    if (!output) return;
+    output.textContent = runtime.debugLogs.length
+      ? runtime.debugLogs.join('\n')
+      : 'Start a fresh dry scan to collect redacted diagnostics.';
+    output.scrollTop = output.scrollHeight;
+  }
+
+  async function copyDiagnostics() {
+    if (!runtime.debugLogs.length) {
+      log('warn', 'There are no diagnostics to copy yet. Start a fresh dry scan first.');
+      return;
+    }
+    const text = diagnosticExportText();
+    let copied = false;
+    try {
+      if (typeof GM_setClipboard === 'function') {
+        GM_setClipboard(text, 'text');
+        copied = true;
+      }
+    } catch {}
+    if (!copied) {
+      try {
+        const clipboard = pageWindow.navigator?.clipboard;
+        if (typeof clipboard?.writeText === 'function') {
+          await clipboard.writeText(text);
+          copied = true;
+        }
+      } catch {}
+    }
+    if (!copied) {
+      try {
+        const helper = document.createElement('textarea');
+        helper.value = text;
+        helper.setAttribute('readonly', '');
+        helper.style.position = 'fixed';
+        helper.style.left = '-10000px';
+        document.body.appendChild(helper);
+        helper.select();
+        copied = Boolean(document.execCommand?.('copy'));
+        helper.remove();
+      } catch {}
+    }
+    log(
+      copied ? 'success' : 'error',
+      copied
+        ? 'Redacted diagnostics copied. Paste the entire block back into this Codex task.'
+        : 'Automatic copy was blocked. Select the diagnostics text manually and copy it.',
+    );
+  }
+
   function updateUi() {
     if (!shadow) return;
     const target = parseTarget();
@@ -2404,6 +2757,7 @@
     updateAuthStatus();
     updateLog();
     updateMatchLog();
+    updateDebugLog();
   }
 
   function bindUi() {
@@ -2428,6 +2782,14 @@
       runtime.matchLogs = [];
       updateLog();
       updateMatchLog();
+    });
+    on('dpe-copy-debug', 'click', () => copyDiagnostics());
+    on('dpe-clear-debug', 'click', () => {
+      runtime.debugLogs = [];
+      runtime.debugEventCount = 0;
+      runtime.suspiciousOwnershipWarningShown = false;
+      updateDebugLog();
+      log('info', 'Redacted diagnostics cleared from memory.');
     });
     on('dpe-risk', 'change', () => {
       const prefs = readConfigFromUi();
@@ -2579,13 +2941,14 @@
         button.primary { background: #5865f2; }
         button.danger { background: #da373c; }
         button.success { background: #248046; }
-        #dpe-log, #dpe-match-log {
+        #dpe-log, #dpe-match-log, #dpe-debug-log {
           overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
           margin: 7px 0; padding: 8px; border-radius: 6px; background: #111214;
           color: #b5bac1; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
         }
         #dpe-log { max-height: 150px; }
         #dpe-match-log { max-height: 280px; user-select: text; }
+        #dpe-debug-log { max-height: 280px; user-select: text; }
         .footer-note { color: #949ba4; font-size: 10px; margin-top: 9px; }
       </style>
       <button id="dpe-launcher" type="button">Privacy Eraser</button>
@@ -2742,12 +3105,19 @@
             <button id="dpe-clear-log" type="button">Clear log</button>
           </details>
           <details open>
+            <summary>Diagnostics for bug reports (<span id="dpe-debug-log-count">0</span>)</summary>
+            <p class="hint">Records response counts, hashed IDs, timestamps, cursors, author distributions, message types, and rate-limit headers. It never includes message text, usernames, raw IDs, credentials, or tokens and stays in memory unless you explicitly copy it.</p>
+            <pre id="dpe-debug-log">Start a fresh dry scan to collect redacted diagnostics.</pre>
+            <button id="dpe-copy-debug" type="button">Copy diagnostics</button>
+            <button id="dpe-clear-debug" type="button">Clear diagnostics</button>
+          </details>
+          <details open>
             <summary>Matched messages in this batch (<span id="dpe-match-log-count">0</span>)</summary>
             <pre id="dpe-match-log">No matching messages have been found in this batch yet.</pre>
           </details>
           <p class="footer-note">
             No message content, attachments, token, cookies, or logs are transmitted anywhere except the Discord API calls required to scan and delete.
-            The saved checkpoint contains only settings, target IDs, message IDs, timestamps, and counters in userscript-manager storage.
+            The saved checkpoint contains only settings, target IDs, message IDs, timestamps, and counters in userscript-manager storage. Diagnostics are memory-only and leave the page only when you press Copy diagnostics.
           </p>
         </main>
       </section>

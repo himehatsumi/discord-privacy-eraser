@@ -10,10 +10,13 @@ const exportBlock = `
     compileFilters,
     configSignature,
     defaultPrefs,
+    diagnosticExportText,
+    debugId,
     emptyRunState,
     getCurrentUser: () => currentUser,
     getRunState: () => runState,
     getRuntime: () => runtime,
+    historyPageDiagnostics,
     isolatePanelEvents,
     isDeleteEverythingConfig,
     markShadowHostAsTextEntry,
@@ -673,6 +676,25 @@ async function testOwnedBatchDoesNotStopAtOneMatchInFirstFiveHundredHistoryMessa
   assert.equal(runtime.matchLogs.length, 100);
   assert.match(runtime.matchLogs[0], /owned message 1000/);
   assert.match(runtime.matchLogs.at(-1), /owned message 402/);
+
+  const diagnostics = runtime.debugLogs.map((line) => JSON.parse(line));
+  const historyPages = diagnostics.filter((entry) => entry.event === 'history-page');
+  assert.equal(historyPages.length, 6);
+  assert.equal(historyPages[0].owned, 1);
+  assert.equal(historyPages[0].authors[0].count, 99);
+  assert.match(historyPages[0].authors[0].author, /^id#[0-9a-f]{8}:18d$/);
+  assert.equal(historyPages[0].authors[1].author, 'self');
+  assert.equal(historyPages[0].authors[1].count, 1);
+  assert.ok(
+    diagnostics.some((entry) => entry.event === 'suspicious-ownership-count'),
+    'sparse ownership should make the copyable diagnostic warning explicit',
+  );
+  const exportedDiagnostics = harness.test.diagnosticExportText();
+  assert.doesNotMatch(exportedDiagnostics, /owned message \d|partner message \d/);
+  assert.doesNotMatch(exportedDiagnostics, new RegExp(USER_A.id));
+  assert.doesNotMatch(exportedDiagnostics, new RegExp(USER_B.id));
+  assert.doesNotMatch(exportedDiagnostics, new RegExp(TARGET_CHANNEL));
+  assert.match(exportedDiagnostics, /message content.*raw account\/channel\/message IDs.*omitted/i);
 }
 
 async function testFastAuthorLookupSnapsToLatestOwnedMessage() {
@@ -715,6 +737,7 @@ async function testFastAuthorLookupSnapsToLatestOwnedMessage() {
   harness.test.acceptToken(TOKEN_A);
   await harness.test.startScan();
   const state = harness.test.getRunState();
+  const runtime = harness.test.getRuntime();
 
   assert.equal(state.status, 'scanned');
   assert.equal(state.anchorMethod, 'search');
@@ -735,6 +758,13 @@ async function testFastAuthorLookupSnapsToLatestOwnedMessage() {
     0,
     'fast lookup must not walk newer combined history before the owned anchor',
   );
+  const searchDiagnostic = runtime.debugLogs
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.event === 'search-response');
+  assert.equal(searchDiagnostic.hitCount, 1);
+  assert.equal(searchDiagnostic.ownedHitCount, 1);
+  assert.equal(searchDiagnostic.selectedAuthorMatches, true);
+  assert.match(searchDiagnostic.selectedAnchor, /^id#[0-9a-f]{8}:4d$/);
 }
 
 async function testFastAuthorLookupFallsBackOnInvalidHit() {
