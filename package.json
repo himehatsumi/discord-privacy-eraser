@@ -1,6 +1,6 @@
 {
   "name": "discord-privacy-eraser",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "description": "A safety-focused userscript for deleting only your own messages in the current Discord channel or DM.",
   "repository": {

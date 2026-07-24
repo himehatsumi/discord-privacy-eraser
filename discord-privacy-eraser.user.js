@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.6.0
+// @version      1.6.1
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -36,7 +36,7 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.6.0',
+    version: '1.6.1',
     prefsKey: 'dpe:prefs:v4',
     legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3'],
     runKey: 'dpe:run:v1',
@@ -90,6 +90,7 @@
     debugLogs: [],
     debugEventCount: 0,
     suspiciousOwnershipWarningShown: false,
+    deletionConfirmation: null,
   };
 
   class StopSignal extends Error {
@@ -701,7 +702,19 @@
     if (
       runtime.debugEventCount <= 5
       || runtime.debugEventCount % 10 === 0
-      || ['suspicious-ownership-count', 'scan-finished', 'scan-error'].includes(entry.event)
+      || [
+        'suspicious-ownership-count',
+        'scan-finished',
+        'scan-error',
+        'deletion-entry',
+        'deletion-blocked',
+        'deletion-confirmation-shown',
+        'deletion-confirmation-result',
+        'deletion-started',
+        'delete-response',
+        'deletion-finished',
+        'deletion-stopped-or-error',
+      ].includes(entry.event)
     ) {
       updateDebugLog();
     }
@@ -2273,27 +2286,97 @@
     }
   }
 
-  async function confirmDeletion() {
+  function deletionConfirmationCopy() {
     const count = runState.queue.length;
     const phrase = `DELETE ${count} FROM ${runState.target.channelId}`;
-    const entered = pageWindow.prompt(
-      [
+    return {
+      count,
+      phrase,
+      lines: [
         `This permanently deletes ${count.toLocaleString()} deletable messages authored by your account`,
         `from ${formatTarget(runState.target)}.`,
         runState.anchorMethod === 'search'
           ? 'Batch 1 began at your latest deletable message found by the fast author-locked lookup.'
           : `Batch 1 began at your latest deletable message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer items.`,
         `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
+        `Deletion order: ${runState.config.deleteOrder} first. The first request targets ${formatDate(runState.queue[0]?.timestamp)}.`,
         runState.batchMode === 'owned'
           ? `After this preview, the run continues in batches of ${runState.config.scanBatchSize.toLocaleString()} deletable messages authored by your account; call/system entries never consume capacity.`
           : `This upgraded checkpoint retains its original ${runState.config.scanBatchSize.toLocaleString()}-history-message batch boundary.`,
         '',
         'Deleted messages cannot be recovered.',
-        `Type exactly: ${phrase}`,
-      ].join('\n'),
+      ],
+    };
+  }
+
+  function finishDeletionConfirmation(accepted) {
+    const pending = runtime.deletionConfirmation;
+    if (!pending) return false;
+    const overlay = shadow?.getElementById('dpe-confirm-overlay');
+    const input = shadow?.getElementById('dpe-confirm-input');
+    const entered = String(input?.value || '').trim();
+    const matched = Boolean(accepted && entered === pending.phrase);
+    runtime.deletionConfirmation = null;
+    if (overlay) overlay.hidden = true;
+    if (input) input.value = '';
+    const startButton = shadow?.getElementById('dpe-confirm-start');
+    if (startButton) startButton.disabled = true;
+    debugLog('deletion-confirmation-result', {
+      accepted: Boolean(accepted),
+      phraseMatched: matched,
+      enteredLength: entered.length,
+      expectedLength: pending.phrase.length,
+    });
+    pending.resolve(matched);
+    return matched;
+  }
+
+  async function confirmDeletion() {
+    const copy = deletionConfirmationCopy();
+    const overlay = shadow?.getElementById('dpe-confirm-overlay');
+    const details = shadow?.getElementById('dpe-confirm-details');
+    const phraseDisplay = shadow?.getElementById('dpe-confirm-phrase');
+    const input = shadow?.getElementById('dpe-confirm-input');
+    const startButton = shadow?.getElementById('dpe-confirm-start');
+    if (overlay && details && phraseDisplay && input && startButton) {
+      if (runtime.deletionConfirmation) finishDeletionConfirmation(false);
+      details.textContent = copy.lines.join('\n');
+      phraseDisplay.textContent = copy.phrase;
+      input.value = '';
+      startButton.disabled = true;
+      overlay.hidden = false;
+      debugLog('deletion-confirmation-shown', {
+        queueCount: copy.count,
+        order: runState.config.deleteOrder,
+        firstMessage: debugId(runState.queue[0]?.id),
+        firstTimestamp: String(runState.queue[0]?.timestamp || ''),
+        confirmationSurface: 'in-panel',
+      });
+      return new Promise((resolve) => {
+        runtime.deletionConfirmation = { phrase: copy.phrase, resolve };
+        try { input.focus(); } catch {}
+      });
+    }
+
+    debugLog('deletion-confirmation-shown', {
+      queueCount: copy.count,
+      order: runState.config.deleteOrder,
+      firstMessage: debugId(runState.queue[0]?.id),
+      firstTimestamp: String(runState.queue[0]?.timestamp || ''),
+      confirmationSurface: 'native-fallback',
+    });
+    const entered = pageWindow.prompt(
+      [...copy.lines, `Type exactly: ${copy.phrase}`].join('\n'),
       '',
     );
-    return typeof entered === 'string' && entered.trim() === phrase;
+    const matched = typeof entered === 'string' && entered.trim() === copy.phrase;
+    debugLog('deletion-confirmation-result', {
+      accepted: typeof entered === 'string',
+      phraseMatched: matched,
+      enteredLength: typeof entered === 'string' ? entered.trim().length : 0,
+      expectedLength: copy.phrase.length,
+    });
+    return matched;
   }
 
   function nextDeleteDelay(config) {
@@ -2333,23 +2416,49 @@
   }
 
   async function startDelete({ resume = false, auto = false } = {}) {
-    if (runtime.mode !== 'idle') return;
+    debugLog('deletion-entry', {
+      resume: Boolean(resume),
+      auto: Boolean(auto),
+      runtimeMode: runtime.mode,
+      status: runState.status,
+      operation: runState.operation,
+      queueCount: runState.queue.length,
+      confirmed: runState.confirmed,
+      targetMatches: sameTarget(parseTarget(), runState.target),
+    });
+    if (runtime.mode !== 'idle') {
+      debugLog('deletion-blocked', { reason: 'runtime-not-idle', runtimeMode: runtime.mode });
+      return;
+    }
     const target = runState.target;
     const config = runState.config;
     if (!target || !config || !runState.queue.length) {
+      debugLog('deletion-blocked', {
+        reason: 'missing-target-config-or-queue',
+        hasTarget: Boolean(target),
+        hasConfig: Boolean(config),
+        queueCount: runState.queue.length,
+      });
       log('error', 'There is no non-empty dry-run queue to delete.');
       return;
     }
     if (!sameTarget(parseTarget(), target)) {
+      debugLog('deletion-blocked', { reason: 'open-target-mismatch' });
       log('error', 'Return to the exact channel/DM used for the dry run before deleting.');
       return;
     }
     if (!validateQueueIntegrity(runState, target)) {
+      debugLog('deletion-blocked', { reason: 'queue-integrity-failed' });
       log('error', 'The saved queue failed its channel or checksum integrity check. Run a new dry scan.');
       return;
     }
 
     try {
+      debugLog('deletion-preflight-start', {
+        queueCount: runState.queue.length,
+        lockedUser: debugId(runState.userId),
+        lockedTarget: debugId(target.channelId),
+      });
       validateConfig(config);
       restorePersistedPacing(config);
       const user = await resolveCurrentUser({ force: true });
@@ -2357,6 +2466,11 @@
       if (runState.signature !== expectedSignature || runState.userId !== user.id) {
         throw new Error('The target, signed-in account, or filters changed. Run a new dry run.');
       }
+      debugLog('deletion-preflight-passed', {
+        authenticatedUser: debugId(user.id),
+        lockedUserMatches: runState.userId === user.id,
+        signatureMatches: runState.signature === expectedSignature,
+      });
       if (!resume && !runState.confirmed) {
         const confirmed = await confirmDeletion();
         if (!confirmed) {
@@ -2366,6 +2480,11 @@
         runState.confirmed = true;
       }
     } catch (error) {
+      debugLog('deletion-preflight-error', {
+        name: String(error?.name || 'Error'),
+        status: Number(error?.status || 0),
+        messageLength: String(error?.message || error || '').length,
+      });
       log('error', error.message);
       return;
     }
@@ -2384,8 +2503,16 @@
     saveRunState();
     log(
       auto ? 'warn' : 'info',
-      `${auto ? 'Auto-resumed' : 'Started'} permanent deletion of the locked dry-run queue.`,
+      `${auto ? 'Auto-resumed' : 'Started'} permanent deletion of the locked dry-run queue. ${config.deleteOrder === 'oldest' ? 'Oldest' : 'Newest'} first; the first request targets ${formatDate(runState.queue[0]?.timestamp)}.`,
     );
+    debugLog('deletion-started', {
+      queueCount: runState.queue.length,
+      order: config.deleteOrder,
+      firstMessage: debugId(runState.queue[0]?.id),
+      firstTimestamp: String(runState.queue[0]?.timestamp || ''),
+      apiVersion,
+      baseDelayMs: config.baseDeleteDelayMs,
+    });
 
     let consecutiveErrors = 0;
     let operationsSinceCheckpoint = 0;
@@ -2404,11 +2531,35 @@
         const message = runState.queue[0];
         let response;
         try {
+          debugLog('delete-request', {
+            message: debugId(message.id),
+            channel: debugId(message.channelId),
+            timestamp: String(message.timestamp || ''),
+            queueRemaining: runState.queue.length,
+            batchPosition: runState.batchProcessed + 1,
+            apiVersion,
+          });
           response = await apiRequest(
             `/channels/${message.channelId}/messages/${message.id}`,
             { method: 'DELETE', purpose: 'message deletion' },
           );
+          debugLog('delete-response', {
+            message: debugId(message.id),
+            timestamp: String(message.timestamp || ''),
+            status: response.status,
+            ok: response.ok,
+            queueRemainingBeforeApply: runState.queue.length,
+            rateLimitRemaining: response.headers.get('X-RateLimit-Remaining'),
+            rateLimitResetAfter: response.headers.get('X-RateLimit-Reset-After'),
+          });
         } catch (error) {
+          debugLog('delete-request-error', {
+            message: debugId(message.id),
+            timestamp: String(message.timestamp || ''),
+            name: String(error?.name || 'Error'),
+            status: Number(error?.status || 0),
+            messageLength: String(error?.message || error || '').length,
+          });
           if (error instanceof StopSignal) throw error;
           if (error instanceof FatalApiError) throw error;
           consecutiveErrors += 1;
@@ -2430,6 +2581,12 @@
           consecutiveErrors = 0;
           runtime.successesSinceLimit += 1;
           operationsSinceCheckpoint += 1;
+          log(
+            response.status === 204 ? 'success' : 'info',
+            response.status === 204
+              ? `Deleted ${runState.deleted.toLocaleString()} total · batch ${runState.batchProcessed.toLocaleString()}/${runState.initialMatches.toLocaleString()} · ${formatDate(message.timestamp)} · ${runState.queue.length.toLocaleString()} queued messages remain.`
+              : `Message at ${formatDate(message.timestamp)} was already gone · ${runState.queue.length.toLocaleString()} queued messages remain.`,
+          );
 
           if (runtime.successesSinceLimit >= 20) {
             runtime.adaptiveDeleteDelayMs = Math.max(
@@ -2484,7 +2641,25 @@
       }
 
       finalizeDeletionBatch(config);
+      debugLog('deletion-finished', {
+        status: runState.status,
+        operation: runState.operation,
+        deleted: runState.deleted,
+        alreadyGone: runState.alreadyGone,
+        failed: runState.failed,
+        queueRemaining: runState.queue.length,
+      });
     } catch (error) {
+      debugLog('deletion-stopped-or-error', {
+        stopped: error instanceof StopSignal,
+        name: String(error?.name || 'Error'),
+        status: Number(error?.status || 0),
+        messageLength: String(error?.message || error || '').length,
+        deleted: runState.deleted,
+        alreadyGone: runState.alreadyGone,
+        failed: runState.failed,
+        queueRemaining: runState.queue.length,
+      });
       if (error instanceof StopSignal) {
         log('info', 'Deletion stopped. Remaining messages were preserved in the checkpoint.');
       } else {
@@ -2631,6 +2806,7 @@
     }
     if (runtime.mode === 'idle') {
       if (runtime.batchLoop) {
+        if (runtime.deletionConfirmation) finishDeletionConfirmation(false);
         runtime.stopped = true;
         runState.status = 'stopped';
         runState.operation = 'batching';
@@ -2840,6 +3016,12 @@
     setText('dpe-failed', runState.failed.toLocaleString());
     setText('dpe-rate-limits', runState.rateLimits.toLocaleString());
     setText(
+      'dpe-next-delete',
+      runState.queue.length
+        ? `${runState.config?.deleteOrder === 'newest' ? 'newest' : 'oldest'} first · ${formatDate(runState.queue[0]?.timestamp)}`
+        : '—',
+    );
+    setText(
       'dpe-range',
       runState.initialMatches
         ? `${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}`
@@ -2911,6 +3093,24 @@
     });
     on('dpe-scan', 'click', () => startScan());
     on('dpe-delete', 'click', () => startContinuousDeletion());
+    on('dpe-confirm-input', 'input', (event) => {
+      const startButton = shadow.getElementById('dpe-confirm-start');
+      const expected = runtime.deletionConfirmation?.phrase || '';
+      if (startButton) {
+        startButton.disabled = !expected || String(event.target?.value || '').trim() !== expected;
+      }
+    });
+    on('dpe-confirm-input', 'keydown', (event) => {
+      if (event.key === 'Escape') finishDeletionConfirmation(false);
+      if (
+        event.key === 'Enter'
+        && !shadow.getElementById('dpe-confirm-start')?.disabled
+      ) {
+        finishDeletionConfirmation(true);
+      }
+    });
+    on('dpe-confirm-cancel', 'click', () => finishDeletionConfirmation(false));
+    on('dpe-confirm-start', 'click', () => finishDeletionConfirmation(true));
     on('dpe-pause', 'click', pauseActive);
     on('dpe-resume', 'click', () => resumeCheckpoint());
     on('dpe-stop', 'click', stopActive);
@@ -3088,10 +3288,42 @@
         #dpe-log { max-height: 150px; }
         #dpe-match-log { max-height: 280px; user-select: text; }
         #dpe-debug-log { max-height: 280px; user-select: text; }
+        [hidden] { display: none !important; }
+        #dpe-confirm-overlay {
+          position: absolute; inset: 0; z-index: 20; padding: 16px;
+          overflow: auto; background: rgba(17,18,20,.96);
+        }
+        .confirm-card {
+          display: grid; gap: 10px; margin: 20px auto; padding: 14px;
+          border: 1px solid #da373c; border-radius: 10px; background: #2b2d31;
+        }
+        .confirm-card h2 { margin: 0; color: #f2f3f5; font-size: 16px; }
+        #dpe-confirm-details, #dpe-confirm-phrase {
+          white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;
+        }
+        #dpe-confirm-details { color: #b5bac1; }
+        #dpe-confirm-phrase {
+          padding: 8px; border-radius: 6px; background: #111214;
+          color: #f0cf70; user-select: text; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+        }
+        .confirm-actions { display: flex; justify-content: flex-end; gap: 7px; }
         .footer-note { color: #949ba4; font-size: 10px; margin-top: 9px; }
       </style>
       <button id="dpe-launcher" type="button">Privacy Eraser</button>
       <section id="dpe-panel" aria-label="Discord Privacy Eraser">
+        <div id="dpe-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="dpe-confirm-title" hidden>
+          <div class="confirm-card">
+            <h2 id="dpe-confirm-title">Confirm permanent deletion</h2>
+            <p id="dpe-confirm-details"></p>
+            <span>Type this exact phrase:</span>
+            <pre id="dpe-confirm-phrase"></pre>
+            <input id="dpe-confirm-input" type="text" autocomplete="off" spellcheck="false">
+            <div class="confirm-actions">
+              <button id="dpe-confirm-cancel" type="button">Cancel</button>
+              <button id="dpe-confirm-start" class="danger" type="button" disabled>Start deletion</button>
+            </div>
+          </div>
+        </div>
         <header>
           <div>
             <strong>${SCRIPT.name}</strong><br>
@@ -3225,7 +3457,7 @@
             <div class="metric"><b id="dpe-failed">0</b><span>Failed</span></div>
             <div class="metric"><b id="dpe-rate-limits">0</b><span>Rate limits</span></div>
           </div>
-          <div class="range">Current batch: <span id="dpe-batch">1</span> · newer skipped: <span id="dpe-skipped">0</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
+          <div class="range">Current batch: <span id="dpe-batch">1</span> · newer skipped: <span id="dpe-skipped">0</span> · matched range: <span id="dpe-range">—</span> · next deletion: <span id="dpe-next-delete">—</span> · pacing: <span id="dpe-pacing">—</span></div>
           <div class="progress"><div id="dpe-progress-bar"></div></div>
           <div class="hint">Processed: <span id="dpe-progress-text">0%</span></div>
           <div class="hint">Before batch 1, the author-locked lookup finds your latest deletable message and rejects call/system entries. After the anchor, any full 100-item history page with no deletable message from you triggers a locked search jump to your next one; invalid search results fall back to direct history.</div>
@@ -3247,7 +3479,7 @@
           </details>
           <details open>
             <summary>Diagnostics for bug reports (<span id="dpe-debug-log-count">0</span>)</summary>
-            <p class="hint">Records response counts, hashed IDs, timestamps, cursors, author distributions, message types, and rate-limit headers. It never includes message text, usernames, raw IDs, credentials, or tokens and stays in memory unless you explicitly copy it.</p>
+            <p class="hint">Records scan and deletion phases, response counts/statuses, hashed IDs, timestamps, cursors, author distributions, message types, and rate-limit headers. It never includes message text, usernames, raw IDs, credentials, or tokens and stays in memory unless you explicitly copy it.</p>
             <pre id="dpe-debug-log">Start a fresh dry scan to collect redacted diagnostics.</pre>
             <button id="dpe-copy-debug" type="button">Copy diagnostics</button>
             <button id="dpe-clear-debug" type="button">Clear diagnostics</button>

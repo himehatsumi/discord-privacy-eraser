@@ -8,6 +8,7 @@ const exportBlock = `
     acceptToken,
     apiRequest,
     compileFilters,
+    confirmDeletion,
     configSignature,
     defaultPrefs,
     diagnosticExportText,
@@ -17,6 +18,7 @@ const exportBlock = `
     getRunState: () => runState,
     getRuntime: () => runtime,
     historyPageDiagnostics,
+    finishDeletionConfirmation,
     isolatePanelEvents,
     isDeletableOwnedMessage,
     isDeleteEverythingConfig,
@@ -28,6 +30,7 @@ const exportBlock = `
     retryAfterMs,
     setCurrentUser: (value) => { currentUser = value; },
     setRunState: (value) => { runState = value; },
+    setShadow: (value) => { shadow = value; },
     startDelete,
     startContinuousDeletion,
     startScan,
@@ -390,6 +393,112 @@ async function testCappedScanAndDelete() {
     harness.prompts[0],
     new RegExp(`Type exactly: DELETE 1 FROM ${TARGET_CHANNEL}`),
     'the irreversible confirmation must encode the locked channel',
+  );
+  const diagnostics = harness.test.getRuntime().debugLogs.map((line) => JSON.parse(line));
+  for (const event of [
+    'deletion-entry',
+    'deletion-preflight-start',
+    'deletion-preflight-passed',
+    'deletion-confirmation-shown',
+    'deletion-confirmation-result',
+    'deletion-started',
+    'delete-request',
+    'delete-response',
+    'deletion-finished',
+  ]) {
+    assert.ok(diagnostics.some((entry) => entry.event === event), `${event} must be diagnosed`);
+  }
+  assert.ok(
+    harness.test.getRuntime().logs.some((entry) => /Deleted 1 total/.test(entry.message)),
+    'successful deletion progress must be visible in the local activity log',
+  );
+}
+
+async function testInPanelConfirmationDrivesUiTriggeredDeletion() {
+  const harness = makeHarness({ scanDelayMs: 0 });
+  const history = [
+    message({
+      id: '901',
+      content: 'inline confirmation target',
+      timestamp: '2026-07-01T12:00:00.000Z',
+    }),
+  ];
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response(historyBefore(url) ? [] : history);
+    }
+    if (method === 'DELETE' && url.endsWith('/messages/901')) return response(null, 204);
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+
+  let focused = false;
+  const elements = new Map([
+    ['dpe-confirm-overlay', { hidden: true }],
+    ['dpe-confirm-details', { textContent: '' }],
+    ['dpe-confirm-phrase', { textContent: '' }],
+    ['dpe-confirm-input', {
+      value: '',
+      focus() { focused = true; },
+    }],
+    ['dpe-confirm-start', { disabled: true }],
+  ]);
+  harness.test.setShadow({
+    getElementById(id) {
+      return elements.get(id) || null;
+    },
+  });
+
+  const deletion = harness.test.startContinuousDeletion();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (harness.test.getRuntime().deletionConfirmation) break;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  const pending = harness.test.getRuntime().deletionConfirmation;
+  assert.ok(pending, 'the UI-triggered deletion must wait on the in-panel confirmation');
+  assert.equal(elements.get('dpe-confirm-overlay').hidden, false);
+  assert.equal(focused, true);
+  assert.equal(
+    harness.calls.filter((call) => call.method === 'DELETE').length,
+    0,
+    'no delete request may start before the typed confirmation resolves',
+  );
+  assert.equal(elements.get('dpe-confirm-phrase').textContent, pending.phrase);
+
+  elements.get('dpe-confirm-input').value = 'wrong phrase';
+  assert.equal(harness.test.finishDeletionConfirmation(true), false);
+  await deletion;
+  assert.equal(harness.test.getRunState().queue.length, 1);
+  assert.equal(
+    harness.calls.filter((call) => call.method === 'DELETE').length,
+    0,
+    'a mismatched in-panel phrase must leave the reviewed queue untouched',
+  );
+
+  const confirmedDeletion = harness.test.startContinuousDeletion();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (harness.test.getRuntime().deletionConfirmation) break;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const confirmedPending = harness.test.getRuntime().deletionConfirmation;
+  assert.ok(confirmedPending);
+  elements.get('dpe-confirm-input').value = confirmedPending.phrase;
+  assert.equal(harness.test.finishDeletionConfirmation(true), true);
+  await confirmedDeletion;
+
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'complete');
+  assert.equal(state.deleted, 1);
+  assert.equal(state.queue.length, 0);
+  assert.equal(elements.get('dpe-confirm-overlay').hidden, true);
+  assert.equal(harness.test.getRuntime().batchLoop, false);
+  assert.equal(
+    harness.calls.filter((call) => call.method === 'DELETE').length,
+    1,
   );
 }
 
@@ -1795,6 +1904,7 @@ async function main() {
   await testCredentialSnifferIgnoresThirdParties();
   await testApiAllowlistBindsMethodPathAndBody();
   await testCappedScanAndDelete();
+  await testInPanelConfirmationDrivesUiTriggeredDeletion();
   await testShortPagesContinueUntilConfirmedEmpty();
   await testTransientEmptyPageDoesNotEndScan();
   await testNewScanIgnoresStaleCheckpointTarget();

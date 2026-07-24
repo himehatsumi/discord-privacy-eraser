@@ -2,6 +2,15 @@
 
 All notable changes are documented here.
 
+## [1.6.1](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.1) — 2026-07-24
+
+- Replaced the native browser prompt with an in-panel exact-phrase confirmation so an asynchronous account preflight cannot leave the destructive action detached from the original button click or silently suppressed by the browser.
+- Added deletion-phase redacted diagnostics for entry, blocking reason, account/signature preflight, confirmation, request, response status, rate-limit headers, completion, and interruption/error.
+- Added a visible activity-log entry after every successful deletion or already-gone response, including its timestamp, batch progress, and remaining queue count.
+- Added the exact next deletion timestamp and oldest/newest order to the panel and confirmation screen, clarifying that an oldest-first queue can operate far above the currently visible latest messages.
+- Preserved valid v1.6.0 scan checkpoints; updating does not require rescanning the already-reviewed queue.
+- Added a UI-triggered regression proving no deletion occurs before the in-panel phrase is accepted and that the queued request is issued and completed afterward.
+
 ## [1.6.0](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.0) — 2026-07-24
 
 - Stopped treating Discord `CALL` messages (type `3`) and other documented non-deletable message types as owned deletion candidates, batch capacity, anchors, filter matches, or queued IDs.

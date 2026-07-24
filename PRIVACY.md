@@ -69,9 +69,9 @@ Those entries exist only in the userscript's current JavaScript memory and the p
 
 ## Memory-only diagnostic log
 
-Version 1.5.1 can create a separate technical trace for investigating incorrect ownership or pagination counts. It contains response counts and status, timestamps, hashed account/channel/message/cursor IDs, anonymized per-page author distributions, message-type counts, missing-author and webhook counts, pagination transitions, active filter categories, API version, rate-limit headers, and final counters.
+The technical trace covers scan and deletion troubleshooting. It contains response counts and status, confirmation outcomes, timestamps, hashed account/channel/message/cursor IDs, anonymized per-page author distributions, message-type counts, missing-author and webhook counts, pagination transitions, active filter categories, API version, rate-limit headers, and final counters.
 
-It deliberately omits message content, usernames, raw Discord IDs, authorization data, cookies, and request headers. The trace is not added to preferences or checkpoints and disappears on reload. It is placed on the clipboard only after the user explicitly clicks **Copy diagnostics**; that copy is intended to be pasted into a private bug report.
+It deliberately omits message content, usernames, raw Discord IDs, authorization data, cookies, request headers, and the typed confirmation text. The trace is not added to preferences or checkpoints and disappears on reload. It is placed on the clipboard only after the user explicitly clicks **Copy diagnostics**; that copy is intended to be pasted into a private bug report.
 
 Use **Clear checkpoint** in the panel to erase saved run data. Removing the userscript through the userscript manager may also provide an option to remove its stored values.
 

@@ -29,7 +29,7 @@ If the session indicator does not turn green, change to another Discord channel 
 4. Leave **Scan, then delete every N deletable messages** at `500`, or choose a batch size from `100` to `10,000`.
 5. Click **Dry run / scan**. It snaps to your actual latest deletable message with an author-locked Discord search, then previews the first anchored batch without deleting anything.
 6. Review the target lock, matched count, date range, and memory-only matched-message log.
-7. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID.
+7. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID, into the in-panel confirmation screen.
 
 Messages newer than your latest deletable message are skipped before batch counting begins. The scanner then collects `500` deletable messages authored by your account, rather than stopping after `500` combined history items. Discord call entries have message type `3`, which Discord's [Message Types table](https://docs.discord.com/developers/resources/message#message-object-message-types) marks as non-deletable; they are ignored even when their author field is your account. They cannot anchor a batch, consume capacity, pass filters, or enter the queue. Unknown future message types also fail closed.
 
@@ -37,7 +37,9 @@ After a full 100-item history page with no deletable message from you, the defau
 
 Every filter match in the current batch appears in the matched-message log. Its detail can be set to full text, a 300-character preview, timestamp/ID only, or off. The default is full text. This log exists only in the current page memory: message content is never written into the checkpoint, browser storage, a file, or a network request.
 
-Version 1.5.1 adds a separate **Diagnostics for bug reports** log. It records the search response shape, hashed cursors and identities, page timestamps, anonymized author counts, message types, missing-author counts, pagination transitions, and rate-limit headers. It never includes message text, usernames, raw Discord IDs, credentials, or tokens. If at most one owned message is recognized after 500 anchored history messages, the activity log tells you the diagnostic trace is ready. Stop the scan, click **Copy diagnostics**, and paste the complete block into the bug report. The trace stays in page memory and is copied only when you explicitly press that button.
+The **Diagnostics for bug reports** log records both scan and deletion phases: search response shape, hashed cursors and identities, page timestamps, anonymized author counts, message types, confirmation state, deletion response statuses, pagination transitions, and rate-limit headers. It never includes message text, usernames, raw Discord IDs, credentials, typed confirmation text, or tokens. Click **Copy diagnostics** and paste the complete block into a bug report; the trace stays in page memory until you explicitly copy it.
+
+During deletion, the panel shows whether the queue is oldest- or newest-first and the timestamp of the next request. Every successful deletion produces an activity-log line with its timestamp, batch progress, and remaining count. This matters with oldest-first order: Discord may be deleting messages much older than the latest messages currently visible in the channel.
 
 The default lookup searches the locked channel for the authenticated account, sorted newest first with a maximum of 25 hits. Every accepted hit must match `/users/@me`, the current channel, the optional sparse-window `max_id`, a valid snowflake/timestamp, and the reviewed normal user-content types (`DEFAULT`, `REPLY`, `CHAT_INPUT_COMMAND`, or `CONTEXT_MENU_COMMAND`). Search failures fall back to direct newest-to-oldest history. All paths obey live rate-limit headers and HTTP 429 `Retry-After`.
 
@@ -86,6 +88,8 @@ Version 1.3.1 starts a new preferences generation so older “preserve pinned by
 
 Version 1.6 introduces a new queue-eligibility version. Pre-1.6 checkpoints are ignored so an older queue containing an authored call entry can never be resumed for deletion. Start a fresh dry scan after updating.
 
+Version 1.6.1 preserves valid v1.6.0 queues. Confirmation now stays inside the userscript panel instead of relying on a browser prompt after asynchronous account validation.
+
 ## Recovery behavior
 
 - **Pause:** Stops before the next request.
@@ -114,7 +118,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
-- Mocked end-to-end scans and deletions covering call-event exclusion, fail-closed message types, max-ID sparse-window jumps, the author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, redacted diagnostics, exact mid-page boundaries, complete memory-only match logs, checkpoint invalidation, no-progress guards, panel input isolation, filters, malformed pages, account changes, persisted cooldowns, HTTP 401, and HTTP 429 recovery.
+- Mocked end-to-end scans and deletions covering the UI-triggered in-panel confirmation handoff, deletion-phase diagnostics and progress, call-event exclusion, fail-closed message types, max-ID sparse-window jumps, the author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, exact mid-page boundaries, complete memory-only match logs, checkpoint invalidation, no-progress guards, panel input isolation, filters, malformed pages, account changes, persisted cooldowns, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 - Release-consistency checks that keep the package, userscript metadata, runtime version, changelog, and README release links aligned.
 
