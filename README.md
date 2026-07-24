@@ -1,6 +1,6 @@
 # Discord Privacy Eraser
 
-`discord-privacy-eraser.user.js` is a local userscript for previewing and permanently deleting **only deletable messages authored by your signed-in account** in the currently open Discord channel or DM.
+`discord-privacy-eraser.user.js` is a local userscript for permanently deleting **only deletable messages authored by your signed-in account** in the currently open Discord channel or DM.
 
 [Latest release](https://github.com/himehatsumi/discord-privacy-eraser/releases/latest) · [Changelog](CHANGELOG.md) · [Privacy](PRIVACY.md) · [Security](SECURITY.md)
 
@@ -8,7 +8,7 @@
 
 Discord says [automating a normal user account is prohibited self-botting](https://support.discord.com/hc/en-us/articles/115002192352-Automated-User-Accounts-Self-Bots) and may result in account termination. This script reduces operational risk by using conservative, adaptive pacing, but it cannot remove that policy risk.
 
-Deletion is permanent. Run the dry scan, verify its count and date range, and use narrow filters first.
+Deletion is permanent. The recommended cleanup button scans before it deletes and requires one exact, target-bound confirmation. Use the optional preview and narrow filters first if you want to audit the queue separately.
 
 ## Install
 
@@ -21,15 +21,17 @@ Deletion is permanent. Run the dry scan, verify its count and date range, and us
 
 If the session indicator does not turn green, change to another Discord channel once. The script observes Discord's existing in-memory session; it never asks you to paste or export a token.
 
-## Recommended first run
+## Recommended cleanup
 
 1. Accept the warning.
 2. With no filters, the default scope is every normal user-content message authored by your account, including pinned, edited, sticker, voice, attachment, and poll messages. Calls and other system entries are ignored.
 3. Uncheck **Include pinned messages** or add dates, protected phrases, or a small maximum such as `10` only if you want a narrower run.
-4. Leave **Scan, then delete every N deletable messages** at `500`, or choose a batch size from `100` to `10,000`.
-5. Click **Dry run / scan**. It snaps to your actual latest deletable message with an author-locked Discord search, then previews the first anchored batch without deleting anything.
-6. Review the target lock, matched count, date range, and memory-only matched-message log.
-7. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID, into the in-panel confirmation screen.
+4. Leave **Scan, then delete every N deletable messages** at `500`. Fresh runs use **Newest first** by default.
+5. Click **Start cleanup: scan 500 → delete → repeat**. It snaps to your actual latest deletable message, collects the first anchored batch, and displays every match.
+6. Type the exact target-and-count-bound phrase into the in-panel confirmation screen. No DELETE request is sent before this one-time confirmation.
+7. Leave the tab open. The script deletes that batch, scans the next 500 of your deletable messages, and repeats until the maximum, date boundary, end of history, stop, or error.
+
+**Preview next batch (optional)** keeps the old two-step workflow available: it scans without deleting, after which **Delete previewed batch…** starts the same confirmed continuation loop.
 
 Messages newer than your latest deletable message are skipped before batch counting begins. The scanner then collects `500` deletable messages authored by your account, rather than stopping after `500` combined history items. Discord call entries have message type `3`, which Discord's [Message Types table](https://docs.discord.com/developers/resources/message#message-object-message-types) marks as non-deletable; they are ignored even when their author field is your account. They cannot anchor a batch, consume capacity, pass filters, or enter the queue. Unknown future message types also fail closed.
 
@@ -39,7 +41,7 @@ Every filter match in the current batch appears in the matched-message log. Its 
 
 The **Diagnostics for bug reports** log records both scan and deletion phases: search response shape, hashed cursors and identities, page timestamps, anonymized author counts, message types, confirmation state, deletion response statuses, pagination transitions, and rate-limit headers. It never includes message text, usernames, raw Discord IDs, credentials, typed confirmation text, or tokens. Click **Copy diagnostics** and paste the complete block into a bug report; the trace stays in page memory until you explicitly copy it.
 
-During deletion, the panel shows whether the queue is oldest- or newest-first and the timestamp of the next request. Every successful deletion produces an activity-log line with its timestamp, batch progress, and remaining count. This matters with oldest-first order: Discord may be deleting messages much older than the latest messages currently visible in the channel.
+During deletion, the panel shows whether the queue is newest- or oldest-first and the timestamp of the next request. Every successful deletion produces an activity-log line with its timestamp, batch progress, and remaining count. Newest-first is the default for fresh runs; oldest-first remains available.
 
 The default lookup searches the locked channel for the authenticated account, sorted newest first with a maximum of 25 hits. Every accepted hit must match `/users/@me`, the current channel, the optional sparse-window `max_id`, a valid snowflake/timestamp, and the reviewed normal user-content types (`DEFAULT`, `REPLY`, `CHAT_INPUT_COMMAND`, or `CONTEXT_MENU_COMMAND`). Search failures fall back to direct newest-to-oldest history. All paths obey live rate-limit headers and HTTP 429 `Retry-After`.
 
@@ -54,7 +56,7 @@ For a very long history, leave the tab open. Pausing or stopping preserves the e
 - History pages must be strictly newest-to-oldest; malformed, duplicate, cross-channel, or out-of-order pages pause without partially trusting the page.
 - The saved queue has a target/account/settings-bound checksum to detect accidental checkpoint corruption.
 - The signed-in identity is rechecked before deletion; an account change stops the run before another message is touched.
-- Dry run and a target-bound typed confirmation are mandatory before a new deletion.
+- A complete pre-deletion scan and a target-bound typed confirmation are mandatory before a new deletion. The recommended button automates the scan-to-confirmation handoff; it does not bypass either gate.
 - Only the first batch can request confirmation; later batches continue under the same account, target, filter, owned-message batch mode, and queue-integrity lock.
 - The unfiltered default includes pinned and edited messages; uncheck either option to preserve that category.
 - Navigation away pauses the run by default.
@@ -74,7 +76,7 @@ For a very long history, leave the tab open. Pausing or stopping preserves the e
 - **Include pinned / edited:** Both are on by default so an otherwise unfiltered run means every deletable message authored by you.
 - **Protect newer than:** Skips recent messages by age in hours.
 - **Maximum deletions:** Caps the complete multi-batch run; `0` is unlimited.
-- **Oldest/newest first:** Controls order and maximum-cap selection inside each scanned batch. Batches themselves always move from newer history toward older history.
+- **Newest/oldest first:** Controls order and maximum-cap selection inside each scanned batch. Newest-first is the fresh-run default. Batches themselves always move from newer history toward older history.
 - **Scan, then delete every N deletable messages:** Controls how many eligible messages authored by the authenticated account form one batch; the default is `500`. Call/system entries do not count.
 - **Matched-message log detail:** Shows every filter match in the current batch as full text, a preview, timestamp/ID only, or not at all. It is memory-only.
 - **Latest-message lookup:** Defaults to the fast author-locked search plus sparse-window jumps and automatic direct-history fallback. “Direct history only” disables searches and remains available for troubleshooting.
@@ -89,6 +91,8 @@ Version 1.3.1 starts a new preferences generation so older “preserve pinned by
 Version 1.6 introduces a new queue-eligibility version. Pre-1.6 checkpoints are ignored so an older queue containing an authored call entry can never be resumed for deletion. Start a fresh dry scan after updating.
 
 Version 1.6.1 preserves valid v1.6.0 queues. Confirmation now stays inside the userscript panel instead of relying on a browser prompt after asynchronous account validation.
+
+Version 1.6.2 adds the recommended single-button scan/delete loop and starts a new preferences generation whose fresh default is newest-first. An active checkpoint still loads its exact reviewed order and settings; finish or clear it before starting with the new defaults.
 
 ## Recovery behavior
 
@@ -118,7 +122,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
-- Mocked end-to-end scans and deletions covering the UI-triggered in-panel confirmation handoff, deletion-phase diagnostics and progress, call-event exclusion, fail-closed message types, max-ID sparse-window jumps, the author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, exact mid-page boundaries, complete memory-only match logs, checkpoint invalidation, no-progress guards, panel input isolation, filters, malformed pages, account changes, persisted cooldowns, HTTP 401, and HTTP 429 recovery.
+- Mocked end-to-end scans and deletions covering the single-button newest-first cleanup handoff, UI-triggered in-panel confirmation, deletion-phase diagnostics and progress, call-event exclusion, fail-closed message types, max-ID sparse-window jumps, the author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, exact mid-page boundaries, complete memory-only match logs, checkpoint invalidation, no-progress guards, panel input isolation, filters, malformed pages, account changes, persisted cooldowns, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 - Release-consistency checks that keep the package, userscript metadata, runtime version, changelog, and README release links aligned.
 

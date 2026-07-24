@@ -28,7 +28,7 @@ Changes should be rejected if they introduce any of the following without an exp
 - Message-content or attachment persistence.
 - Deletion without author-ID verification.
 - Server-wide, multi-channel, or all-DM deletion scope.
-- Removal of the dry run, target lock, or in-panel exact typed confirmation.
+- Removal of the complete pre-deletion scan, target lock, or in-panel exact typed confirmation. Combining the scan and deletion loop behind one button must not bypass those gates.
 - Issuing a delete request before the target-and-count-bound phrase is accepted, or including typed confirmation text in diagnostics.
 - Continuing an automatically confirmed batch after its account, target, filter signature, or queue-integrity lock changes.
 - Counting or queueing any message newer than the authenticated account's discovered latest-message anchor in a fresh run.

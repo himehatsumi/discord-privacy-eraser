@@ -2,6 +2,17 @@
 
 All notable changes are documented here.
 
+## [1.6.2](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.2) — 2026-07-24
+
+- Added a prominent single cleanup button that scans one bounded batch, hands it directly to the existing exact-phrase confirmation, deletes it, and automatically repeats scan → delete until completion.
+- Kept the optional preview-only and delete-previewed controls for manual inspection without making them part of the recommended workflow.
+- Made newest-first the default for fresh runs and placed it first in the order selector.
+- Started preferences generation v5 so an old saved oldest-first default does not override the new behavior.
+- Preserved the exact order and settings of active v1.6 checkpoints; clearing or completing a checkpoint returns the interface to the new fresh defaults.
+- Added redacted diagnostics for the combined-flow start, scan-to-delete handoff, no-delete outcome, and completion.
+- Added end-to-end coverage proving the combined flow scans, confirms exactly once, and deletes the newest selected message without a separate delete action.
+- Prevented a failed fresh-scan preflight from handing an older unconfirmed queue to the deletion stage.
+
 ## [1.6.1](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.1) — 2026-07-24
 
 - Replaced the native browser prompt with an in-panel exact-phrase confirmation so an asynchronous account preflight cannot leave the destructive action detached from the original button click or silently suppressed by the browser.

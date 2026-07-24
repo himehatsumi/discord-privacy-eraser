@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.6.1
-// @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
+// @version      1.6.2
+// @description  Safely scan and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
 // @match        https://canary.discord.com/channels/*
@@ -25,7 +25,7 @@
    * - Only calls same-origin /api/v9 or /api/v10 endpoints.
    * - Never asks for, displays, logs, copies, exports, or persists the account token.
    * - Verifies every queued message was authored by /users/@me before deletion.
-   * - Locks each run to the current channel/DM and requires a dry run + typed confirmation.
+   * - Locks each run to the current channel/DM and requires a scan + typed confirmation.
    * - Does not load remote code or fetch attachments.
    *
    * PLATFORM NOTE
@@ -36,9 +36,9 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.6.1',
-    prefsKey: 'dpe:prefs:v4',
-    legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3'],
+    version: '1.6.2',
+    prefsKey: 'dpe:prefs:v5',
+    legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3', 'dpe:prefs:v4'],
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
     maxLogLines: 180,
@@ -85,6 +85,7 @@
     activeTarget: null,
     preflight: false,
     batchLoop: false,
+    oneClickFlow: false,
     logs: [],
     matchLogs: [],
     debugLogs: [],
@@ -121,7 +122,7 @@
     includeEdited: true,
     minMessageAgeHours: 0,
     maxMessages: 0,
-    deleteOrder: 'oldest',
+    deleteOrder: 'newest',
     scanDelayMs: 250,
     baseDeleteDelayMs: 1100,
     maxAdaptiveDelayMs: 30000,
@@ -1768,12 +1769,16 @@
     setChecked('dpe-risk', prefs.riskAccepted);
   }
 
-  async function startScan({ resume = false, continuation = false } = {}) {
-    if (runtime.mode !== 'idle') return;
+  async function startScan({
+    resume = false,
+    continuation = false,
+    preserveDebug = false,
+  } = {}) {
+    if (runtime.mode !== 'idle') return false;
     const target = (resume || continuation) ? runState.target : parseTarget();
     if (!target) {
       log('error', 'Open the exact Discord channel or DM you want to clean first.');
-      return;
+      return false;
     }
 
     const config = (resume || continuation) && runState.config
@@ -1783,10 +1788,10 @@
       validateConfig(config);
     } catch (error) {
       log('error', error.message);
-      return;
+      return false;
     }
 
-    if (!resume && !continuation) {
+    if (!resume && !continuation && !preserveDebug) {
       runtime.debugLogs = [];
       runtime.debugEventCount = 0;
       runtime.suspiciousOwnershipWarningShown = false;
@@ -1886,7 +1891,7 @@
       runState.status = runState.anchorFound ? 'scanning' : 'seeking-latest';
       runtime.preflight = false;
 
-      savePrefs(config);
+      if (!resume && !continuation) savePrefs(config);
       saveRunState();
       const { compiledRegex, excludedTerms } = compileFilters(config);
       let before = (canResume || canContinue) ? runState.scanCursor : '';
@@ -2249,6 +2254,7 @@
         queued: runState.queue.length,
         scanCursor: debugId(runState.scanCursor),
       });
+      return true;
     } catch (error) {
       const errorText = String(error?.message || error || '');
       debugLog('scan-error', {
@@ -2274,6 +2280,7 @@
         }
         log('error', error.message || String(error));
       }
+      return false;
     } finally {
       runtime.mode = 'idle';
       runtime.paused = false;
@@ -2401,6 +2408,9 @@
     runState.confirmed = !workflowComplete;
     saveRunState();
     if (workflowComplete) {
+      if (storageGet(SCRIPT.prefsKey, null) === null) {
+        applyPrefsToUi(loadPrefs());
+      }
       log(
         'success',
         `${recovered ? 'Recovered completed batch. ' : ''}Finished: ${runState.deleted.toLocaleString()} deleted, ${runState.alreadyGone.toLocaleString()} already gone, ${runState.failed.toLocaleString()} failed.`,
@@ -2752,6 +2762,78 @@
     }
   }
 
+  async function startCleanupLoop() {
+    if (runtime.mode !== 'idle' || runtime.batchLoop || runtime.oneClickFlow) return;
+
+    const target = parseTarget();
+    if (!target) {
+      log('error', 'Open the exact Discord channel or DM you want to clean first.');
+      return;
+    }
+    if (
+      runState.confirmed
+      && runState.target
+      && runState.operation
+      && runState.status !== 'complete'
+    ) {
+      log(
+        'error',
+        'A confirmed cleanup checkpoint already exists. Resume or clear that checkpoint before starting a new cleanup.',
+      );
+      return;
+    }
+
+    runtime.oneClickFlow = true;
+    runtime.debugLogs = [];
+    runtime.debugEventCount = 0;
+    runtime.suspiciousOwnershipWarningShown = false;
+    updateDebugLog();
+    debugLog('cleanup-loop-start', {
+      targetKind: target.kind,
+      targetChannel: debugId(target.channelId),
+      requestedBatchSize: readConfigFromUi().scanBatchSize,
+      requestedOrder: readConfigFromUi().deleteOrder,
+    });
+    log(
+      'info',
+      'Cleanup loop started: scan one batch, confirm once, delete it, then repeat with older batches until no matches remain.',
+    );
+    updateUi();
+    try {
+      const scanCompleted = await startScan({ preserveDebug: true });
+      if (
+        scanCompleted
+        && runState.status === 'scanned'
+        && runState.queue.length > 0
+        && sameTarget(runState.target, target)
+      ) {
+        debugLog('cleanup-loop-handoff', {
+          batch: runState.batchNumber,
+          queued: runState.queue.length,
+          order: runState.config?.deleteOrder || '',
+          firstMessage: debugId(runState.queue[0]?.id),
+        });
+        await startContinuousDeletion();
+      } else {
+        debugLog('cleanup-loop-no-delete', {
+          status: runState.status,
+          queued: runState.queue.length,
+          historyComplete: runState.historyComplete,
+        });
+      }
+    } finally {
+      runtime.oneClickFlow = false;
+      debugLog('cleanup-loop-finished', {
+        status: runState.status,
+        batch: runState.batchNumber,
+        deleted: runState.deleted,
+        remaining: runState.queue.length,
+        historyComplete: runState.historyComplete,
+      });
+      updateUi();
+    }
+  }
+
   function batchProgressFingerprint() {
     return [
       runState.status,
@@ -2891,6 +2973,7 @@
     }
     storageDelete(SCRIPT.runKey);
     runState = emptyRunState();
+    applyPrefsToUi(loadPrefs());
     log('info', 'Local checkpoint cleared.');
     updateUi();
   }
@@ -2992,7 +3075,7 @@
     setText('dpe-current-target', formatTarget(target));
     setText(
       'dpe-locked-target',
-      runState.target ? formatTarget(runState.target) : 'No dry run yet',
+      runState.target ? formatTarget(runState.target) : 'No scan yet',
     );
     setText('dpe-status', runtime.paused ? 'paused' : runState.status);
     setText('dpe-batch', runState.batchNumber.toLocaleString());
@@ -3035,10 +3118,14 @@
     if (progress) progress.style.width = `${percent}%`;
     setText('dpe-progress-text', total ? `${percent.toFixed(1)}%` : '0%');
 
-    const isBusy = runtime.mode !== 'idle' || runtime.batchLoop;
+    const isBusy = runtime.mode !== 'idle' || runtime.batchLoop || runtime.oneClickFlow;
     const savedOperation = Boolean(runState.operation && runState.target);
     const sameLockedTarget = sameTarget(target, runState.target);
     const prefs = readConfigFromUi();
+    setText(
+      'dpe-cleanup-loop',
+      `Start cleanup: scan ${prefs.scanBatchSize.toLocaleString()} → delete → repeat`,
+    );
     setText(
       'dpe-scope-note',
       isDeleteEverythingConfig(prefs)
@@ -3060,6 +3147,7 @@
       const element = shadow.getElementById(id);
       if (element) element.disabled = Boolean(disabled);
     };
+    setDisabled('dpe-cleanup-loop', isBusy || !target);
     setDisabled('dpe-scan', isBusy || !target);
     setDisabled('dpe-delete', !deletable);
     setDisabled('dpe-pause', !isBusy || runtime.paused);
@@ -3091,6 +3179,7 @@
     on('dpe-close', 'click', () => {
       shadow.getElementById('dpe-panel')?.classList.remove('open');
     });
+    on('dpe-cleanup-loop', 'click', () => startCleanupLoop());
     on('dpe-scan', 'click', () => startScan());
     on('dpe-delete', 'click', () => startContinuousDeletion());
     on('dpe-confirm-input', 'input', (event) => {
@@ -3271,6 +3360,7 @@
         .progress { height: 8px; overflow: hidden; border-radius: 999px; background: #111214; margin: 7px 0; }
         #dpe-progress-bar { width: 0; height: 100%; background: #23a559; transition: width .2s; }
         .actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+        .actions > .full { flex: 1 1 100%; }
         button {
           border: 0; border-radius: 5px; padding: 8px 10px; cursor: pointer;
           background: #4e5058; color: #fff; font-weight: 700;
@@ -3344,7 +3434,7 @@
           </div>
           <div class="target">
             <span>Open now</span><span id="dpe-current-target">—</span>
-            <span>Dry-run lock</span><span id="dpe-locked-target">No dry run yet</span>
+            <span>Scan lock</span><span id="dpe-locked-target">No scan yet</span>
             <span>State</span><span id="dpe-status">idle</span>
           </div>
 
@@ -3401,8 +3491,8 @@
                 <label class="field">
                   <span>Order inside each batch</span>
                   <select id="dpe-order">
-                    <option value="oldest">Oldest first</option>
                     <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
                   </select>
                 </label>
               </div>
@@ -3463,8 +3553,12 @@
           <div class="hint">Before batch 1, the author-locked lookup finds your latest deletable message and rejects call/system entries. After the anchor, any full 100-item history page with no deletable message from you triggers a locked search jump to your next one; invalid search results fall back to direct history.</div>
 
           <div class="actions">
-            <button id="dpe-scan" class="primary" type="button">1. Dry run / scan</button>
-            <button id="dpe-delete" class="danger" type="button" disabled>2. Delete queued…</button>
+            <button id="dpe-cleanup-loop" class="danger full" type="button">Start cleanup: scan 500 → delete → repeat</button>
+          </div>
+          <div class="hint">Recommended: scans the next batch, asks for one exact confirmation before the first DELETE, then keeps scanning and deleting older batches automatically. Newest-first is the fresh-run default.</div>
+          <div class="actions">
+            <button id="dpe-scan" class="primary" type="button">Preview next batch (optional)</button>
+            <button id="dpe-delete" class="danger" type="button" disabled>Delete previewed batch…</button>
             <button id="dpe-pause" type="button" disabled>Pause</button>
             <button id="dpe-resume" class="success" type="button" disabled>Resume</button>
             <button id="dpe-stop" type="button" disabled>Stop</button>
@@ -3497,10 +3591,16 @@
     `;
     isolatePanelEvents(shadow.getElementById('dpe-panel'));
     document.body.appendChild(rootHost);
-    applyPrefsToUi(loadPrefs());
+    const hasActiveCheckpoint = Boolean(
+      runState.target
+      && runState.config
+      && runState.status !== 'idle'
+      && runState.status !== 'complete'
+    );
+    applyPrefsToUi(hasActiveCheckpoint ? runState.config : loadPrefs());
     bindUi();
     updateUi();
-    log('info', 'Ready. Open the target channel/DM, review filters, then run a dry scan.');
+    log('info', 'Ready. Open the target channel/DM, review filters, then start the cleanup loop.');
     scheduleAutoResume();
   }
 

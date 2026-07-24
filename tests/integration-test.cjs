@@ -31,6 +31,7 @@ const exportBlock = `
     setCurrentUser: (value) => { currentUser = value; },
     setRunState: (value) => { runState = value; },
     setShadow: (value) => { shadow = value; },
+    startCleanupLoop,
     startDelete,
     startContinuousDeletion,
     startScan,
@@ -157,8 +158,8 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     riskAccepted: true,
     ...prefsOverride,
   };
-  if (!stored.has('dpe:prefs:v4')) {
-    stored.set('dpe:prefs:v4', JSON.stringify(prefs));
+  if (!stored.has('dpe:prefs:v5')) {
+    stored.set('dpe:prefs:v5', JSON.stringify(prefs));
   }
 
   const context = {
@@ -631,6 +632,45 @@ async function testFailedScanPreflightPreservesExistingCheckpoint() {
   assert.deepEqual(Array.from(state.queue, (item) => item.id), ['777']);
 }
 
+async function testOneClickFailedPreflightNeverHandsOffStaleQueue() {
+  const harness = makeHarness();
+  let identityCalls = 0;
+  harness.test.setRunState({
+    ...harness.test.emptyRunState(),
+    status: 'scanned',
+    target: {
+      guildId: '@me',
+      channelId: TARGET_CHANNEL,
+      kind: 'DM / group DM',
+    },
+    config: { ...harness.prefs },
+    queue: [{
+      id: '777',
+      channelId: TARGET_CHANNEL,
+      timestamp: '2026-07-01T00:00:00.000Z',
+    }],
+  });
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) {
+      identityCalls += 1;
+      return response({ message: 'Unauthorized' }, 401);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startCleanupLoop();
+
+  assert.equal(identityCalls, 1, 'a failed fresh scan must not start deletion preflight');
+  assert.equal(harness.prompts.length, 0);
+  assert.equal(harness.calls.some((call) => call.method === 'DELETE'), false);
+  assert.deepEqual(
+    Array.from(harness.test.getRunState().queue, (item) => item.id),
+    ['777'],
+    'the pre-existing unconfirmed queue should remain untouched',
+  );
+}
+
 async function testOldestCapBoundsWorkingQueue() {
   const harness = makeHarness({ maxMessages: 2, deleteOrder: 'oldest' });
   let checkedWorkingSet = false;
@@ -732,6 +772,47 @@ async function testContinuousFiveHundredMessageBatches() {
     (call) => call.method === 'GET' && historyBefore(call.url) === '201',
   );
   assert.ok(firstDeleteIndex > 0 && firstDeleteIndex < sixthHistoryIndex);
+}
+
+async function testOneClickCleanupScansConfirmsAndDeletesNewestFirst() {
+  const harness = makeHarness({
+    deleteOrder: 'newest',
+    maxMessages: 1,
+    scanBatchSize: 100,
+    scanDelayMs: 0,
+  });
+  const history = [
+    message({ id: '300', content: 'newest', timestamp: '2026-07-03T12:00:00.000Z' }),
+    message({ id: '200', content: 'older', timestamp: '2026-07-02T12:00:00.000Z' }),
+  ];
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response(historyBefore(url) ? [] : history);
+    }
+    if (method === 'DELETE' && url.endsWith('/messages/300')) return response(null, 204);
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startCleanupLoop();
+
+  const state = harness.test.getRunState();
+  const deletedIds = harness.calls
+    .filter((call) => call.method === 'DELETE')
+    .map((call) => call.url.split('/').at(-1));
+  assert.deepEqual(deletedIds, ['300']);
+  assert.equal(state.status, 'complete');
+  assert.equal(state.deleted, 1);
+  assert.equal(harness.prompts.length, 1, 'the combined flow should confirm exactly once');
+  assert.ok(
+    harness.test.getRuntime().debugLogs.some((line) => line.includes('cleanup-loop-start')),
+    'diagnostics should retain the combined-flow start event',
+  );
+  assert.ok(
+    harness.test.getRuntime().debugLogs.some((line) => line.includes('cleanup-loop-handoff')),
+    'diagnostics should show the automatic scan-to-delete handoff',
+  );
 }
 
 async function testCustomBatchNeverOvershoots() {
@@ -1623,6 +1704,11 @@ function matchesMessageForConfig(harness, candidate, config) {
 
 function testQueueOrderingAndConfigValidation() {
   const harness = makeHarness();
+  assert.equal(
+    harness.test.defaultPrefs.deleteOrder,
+    'newest',
+    'fresh userscript preferences should delete newest-first',
+  );
   const items = [
     { id: '10', timestamp: '2026-07-03T00:00:00.000Z' },
     { id: '2', timestamp: '2026-07-01T00:00:00.000Z' },
@@ -1909,8 +1995,10 @@ async function main() {
   await testTransientEmptyPageDoesNotEndScan();
   await testNewScanIgnoresStaleCheckpointTarget();
   await testFailedScanPreflightPreservesExistingCheckpoint();
+  await testOneClickFailedPreflightNeverHandsOffStaleQueue();
   await testOldestCapBoundsWorkingQueue();
   await testContinuousFiveHundredMessageBatches();
+  await testOneClickCleanupScansConfirmsAndDeletesNewestFirst();
   await testCustomBatchNeverOvershoots();
   await testOwnedBatchDoesNotStopAtOneMatchInFirstFiveHundredHistoryMessages();
   await testFastAuthorLookupSnapsToLatestOwnedMessage();

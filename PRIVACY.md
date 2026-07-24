@@ -8,7 +8,7 @@ The userscript reads:
 
 - The current Discord channel or DM ID from the browser URL.
 - The signed-in account ID from Discord's `/users/@me` API response.
-- Channel message history returned by Discord while a dry scan is running.
+- Channel message history returned by Discord while a scan is running.
 - Author-filtered search hits used to anchor a fresh run and to jump past full 100-item windows with no deletable owned message, unless direct-history-only mode is selected.
 - Discord rate-limit response headers.
 - The existing in-memory authorization header used by the Discord web client.
@@ -43,6 +43,8 @@ Preferences and recovery checkpoints are stored only using the userscript manage
 
 Version 1.6 adds a queue-eligibility version. Checkpoints created before the documented message-type gate are ignored, preventing an older queue containing an authored call entry from being resumed for deletion. Preferences remain private and separate from run checkpoints.
 
+Version 1.6.2 starts private preferences generation v5 to make newest-first the fresh-run default. Active checkpoints retain their exact settings and order independently of this preference change.
+
 Version 1.1 also removes the two namespaced page-storage keys that version 1.0 could have created when private userscript storage was unavailable. It does not remove or modify Discord's own storage keys.
 
 A checkpoint may contain:
@@ -63,7 +65,7 @@ It does not contain message content, attachment URLs, cookies, the authorization
 
 ## Memory-only matched-message log
 
-During a live scan, the panel can display every filter match in the current batch as full text, a 300-character preview, timestamp/ID only, or not at all. Full text is the default for a fresh v1.5 run so the dry-run queue can be audited before deletion.
+During a live scan, the panel can display every filter match in the current batch as full text, a 300-character preview, timestamp/ID only, or not at all. Full text is the default so the bounded queue can be audited before deletion, including during the single-button cleanup flow.
 
 Those entries exist only in the userscript's current JavaScript memory and the panel's shadow DOM. They are cleared when the page is reloaded, the next batch starts, or the log is cleared. They are never included in preferences or checkpoints, written to a file or clipboard, or transmitted anywhere. After a reload, an interrupted checkpoint can resume safely, but message text found before the reload is intentionally not reconstructed or persisted.
 
