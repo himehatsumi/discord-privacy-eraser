@@ -144,8 +144,8 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     riskAccepted: true,
     ...prefsOverride,
   };
-  if (!stored.has('dpe:prefs:v2')) {
-    stored.set('dpe:prefs:v2', JSON.stringify(prefs));
+  if (!stored.has('dpe:prefs:v3')) {
+    stored.set('dpe:prefs:v3', JSON.stringify(prefs));
   }
 
   const context = {
@@ -610,6 +610,111 @@ async function testCustomBatchNeverOvershoots() {
   assert.equal(state.status, 'scanned');
 }
 
+async function testFirstBatchAnchorsAtLatestOwnedMessage() {
+  const harness = makeHarness({ scanBatchSize: 100, scanDelayMs: 0 });
+  const page = (high, count, ownIds = new Set()) => Array.from(
+    { length: count },
+    (_, index) => {
+      const id = String(high - index);
+      return message({
+        id,
+        author: ownIds.has(id) ? USER_A : USER_B,
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+      });
+    },
+  );
+  const pages = new Map([
+    ['', page(1000, 100)],
+    ['901', page(900, 100)],
+    ['801', page(800, 100)],
+    ['701', page(700, 100, new Set(['650', '620']))],
+    ['601', page(600, 50, new Set(['600']))],
+  ]);
+  const requestedLimits = [];
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      requestedLimits.push(Number(new URL(url).searchParams.get('limit')));
+      const before = historyBefore(url) || '';
+      if (!pages.has(before)) throw new Error(`Unexpected anchor cursor ${before}`);
+      return response(pages.get(before));
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.anchorFound, true);
+  assert.equal(state.skippedNewerMessages, 350);
+  assert.equal(state.scannedMessages, 450);
+  assert.equal(state.batchScannedMessages, 100);
+  assert.equal(state.batchOwnedMessages, 3);
+  assert.equal(state.batchFilterMatches, 3);
+  assert.deepEqual(requestedLimits, [100, 100, 100, 100, 50]);
+  assert.deepEqual(
+    Array.from(state.queue, (item) => item.id),
+    ['600', '620', '650'],
+    'batch 1 must begin at the newest owned message and exclude every newer partner message',
+  );
+}
+
+async function testLatestMessageSeekHasNoFixedDelay() {
+  const harness = makeHarness({ scanBatchSize: 100, scanDelayMs: 60000 });
+  const page = (high, author) => Array.from({ length: 100 }, (_, index) => message({
+    id: String(high - index),
+    author: index === 0 ? author : USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response(historyBefore(url) ? page(100, USER_A) : page(200, USER_B));
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  const startedAt = Date.now();
+  await harness.test.startScan();
+  const elapsedMs = Date.now() - startedAt;
+  const state = harness.test.getRunState();
+
+  assert.equal(state.skippedNewerMessages, 100);
+  assert.equal(state.batchScannedMessages, 100);
+  assert.ok(
+    elapsedMs < 5000,
+    `latest-message seek should not apply the configured 60s batch delay (took ${elapsedMs}ms)`,
+  );
+}
+
+async function testLatestMessageSeekCompletesWhenNoOwnedMessageExists() {
+  const harness = makeHarness({ scanDelayMs: 0 });
+  const partnerPage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(200 - index),
+    author: USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 200 - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response(historyBefore(url) ? [] : partnerPage);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+
+  assert.equal(state.status, 'complete');
+  assert.equal(state.anchorFound, false);
+  assert.equal(state.skippedNewerMessages, 100);
+  assert.equal(state.queue.length, 0);
+}
+
 async function testContinuousBatchingStopsOnUnchangedPreflightFailure() {
   const harness = makeHarness({ scanBatchSize: 500 });
   let identityRequests = 0;
@@ -968,6 +1073,10 @@ function testQueueOrderingAndConfigValidation() {
 
   const valid = { ...harness.test.defaultPrefs, riskAccepted: true };
   assert.doesNotThrow(() => harness.test.validateConfig(valid));
+  assert.doesNotThrow(
+    () => harness.test.validateConfig({ ...valid, scanDelayMs: 0 }),
+    'zero artificial batch-scan delay remains protected by live Discord rate-limit handling',
+  );
   assert.throws(
     () => harness.test.validateConfig({ ...valid, baseDeleteDelayMs: 0 }),
     /outside its safe range/,
@@ -1229,6 +1338,9 @@ async function main() {
   await testOldestCapBoundsWorkingQueue();
   await testContinuousFiveHundredMessageBatches();
   await testCustomBatchNeverOvershoots();
+  await testFirstBatchAnchorsAtLatestOwnedMessage();
+  await testLatestMessageSeekHasNoFixedDelay();
+  await testLatestMessageSeekCompletesWhenNoOwnedMessageExists();
   await testContinuousBatchingStopsOnUnchangedPreflightFailure();
   await testCompletedBoundaryCheckpointDoesNotOverscan();
   await testEmptyDeletionCheckpointAdvancesSafely();

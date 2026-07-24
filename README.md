@@ -25,15 +25,17 @@ If the session indicator does not turn green, change to another Discord channel 
 2. With no filters, the default scope is every message authored by your account, including pinned and edited messages.
 3. Uncheck **Include pinned messages** or add dates, protected phrases, or a small maximum such as `10` only if you want a narrower run.
 4. Leave **Scan, then delete every N history messages** at `500`, or choose a batch size from `100` to `10,000`.
-5. Click **Dry run / scan**. It previews the first batch and does not delete anything.
+5. Click **Dry run / scan**. It fast-seeks backward to your actual latest message, then previews the first anchored batch without deleting anything.
 6. Review the target lock, matched count, and date range.
 7. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID.
 
-“500 history messages” means 500 combined messages from everyone in the channel or DM, not 500 of your messages. The preview now reports the combined count, how many were authored by the authenticated account, how many passed filters, and how many were queued. Older history is deliberately not scanned until the first reviewed queue is confirmed.
+Messages newer than your latest message are skipped before batch counting begins. “500 history messages” then means 500 combined messages from everyone starting at your latest message and moving older, not 500 of your messages. The preview reports the inspected total, newer messages skipped, anchored batch count, how many were authored by the authenticated account, how many passed filters, and how many were queued. Older history is deliberately not scanned until the first reviewed queue is confirmed.
 
 After that one confirmation, the script deletes the reviewed matches, scans the next 500 combined history messages, deletes that batch's matches, and repeats until it reaches the configured maximum, date boundary, or end of history. A batch with no matches is skipped without pausing. The maximum deletion setting applies to the entire run, not separately to every batch.
 
-For a very long history, leave the tab open. Pausing or stopping preserves the exact scan/delete batch checkpoint. HTTP 429 responses respect Discord's `Retry-After`; transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
+The initial anchor seek has no fixed timer: it requests the next page as soon as the previous one completes, while still learning Discord's rate-limit headers and obeying every cooldown or HTTP 429 `Retry-After`. Post-anchor batch scanning defaults to 250 ms between pages and remains configurable.
+
+For a very long history, leave the tab open. Pausing or stopping preserves the exact seek/scan/delete checkpoint. Transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
 
 ## Safety properties
 
@@ -64,12 +66,15 @@ For a very long history, leave the tab open. Pausing or stopping preserves the e
 - **Maximum deletions:** Caps the complete multi-batch run; `0` is unlimited.
 - **Oldest/newest first:** Controls order and maximum-cap selection inside each scanned batch. Batches themselves always move from newer history toward older history.
 - **Scan, then delete every N:** Controls the raw history-message batch size; the default is exactly `500`.
+- **Batch scan delay:** Adds optional spacing after the owned-message anchor is found. It does not slow the initial rate-limit-aware seek.
 - **Confirm empty history pages:** Requires repeated empty responses before declaring the scan complete.
 - **Invalid requests / 10 min:** Pauses after the configured number of counted 401/403/429 responses; shared-resource 429 responses are excluded.
 
 Age filters use one fixed timestamp for the entire run, including after pause/reload. Each batch retains only its bounded working set instead of keeping every match from a long conversation in memory.
 
 Version 1.3.1 starts a new preferences generation so older “preserve pinned by default” settings cannot silently contradict the new delete-everything default. Existing interrupted run checkpoints retain their original locked settings and must be cleared or completed separately.
+
+Version 1.4 starts another fresh UI preference generation for the faster 250 ms batch-scan default. Pre-1.4 run checkpoints retain their previously reviewed origin; clear the checkpoint and start a new dry scan to use latest-message anchoring.
 
 ## Recovery behavior
 

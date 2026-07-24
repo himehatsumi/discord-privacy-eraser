@@ -27,6 +27,7 @@ Changes should be rejected if they introduce any of the following without an exp
 - Server-wide, multi-channel, or all-DM deletion scope.
 - Removal of the dry run, target lock, or typed confirmation.
 - Continuing an automatically confirmed batch after its account, target, filter signature, or queue-integrity lock changes.
+- Counting or queueing any message newer than the authenticated account's discovered latest-message anchor in a fresh run.
 - Removal of queue-integrity, strict history-ordering, or invalid-request circuit checks.
 - Removing the batch no-progress guard or allowing a batch request to exceed its configured capacity.
 - Retrying HTTP 429 before Discord's `Retry-After` period has elapsed.

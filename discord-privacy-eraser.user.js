@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.3.1
+// @version      1.4.0
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -35,9 +35,9 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.3.1',
-    prefsKey: 'dpe:prefs:v2',
-    legacyPrefsKeys: ['dpe:prefs:v1'],
+    version: '1.4.0',
+    prefsKey: 'dpe:prefs:v3',
+    legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2'],
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
     maxLogLines: 180,
@@ -108,7 +108,7 @@
     minMessageAgeHours: 0,
     maxMessages: 0,
     deleteOrder: 'oldest',
-    scanDelayMs: 750,
+    scanDelayMs: 250,
     baseDeleteDelayMs: 1100,
     maxAdaptiveDelayMs: 30000,
     jitterPercent: 15,
@@ -375,6 +375,8 @@
       failures: [],
       scanCursor: '',
       historyComplete: false,
+      anchorFound: false,
+      skippedNewerMessages: 0,
       batchNumber: 1,
       batchScannedMessages: 0,
       batchOwnedMessages: 0,
@@ -432,6 +434,9 @@
       ...saved,
       config,
       signature,
+      anchorFound: saved.anchorFound === undefined
+        ? true
+        : Boolean(saved.anchorFound),
       // Pre-1.3 runs were single-queue workflows. Treat their completed scan
       // scope as final so upgrading cannot silently expand a prior confirmation
       // into the new multi-batch behavior.
@@ -937,6 +942,13 @@
       || /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(filename);
   }
 
+  function isAuthoredByUser(message, userId) {
+    return Boolean(
+      message?.author?.id
+      && String(message.author.id) === String(userId || ''),
+    );
+  }
+
   function matchesMessage(
     message,
     config,
@@ -944,10 +956,7 @@
     excludedTerms,
     referenceTime = Date.now(),
   ) {
-    if (
-      !message?.author?.id
-      || String(message.author.id) !== String(currentUser?.id || '')
-    ) return false;
+    if (!isAuthoredByUser(message, currentUser?.id)) return false;
     if (!config.includePinned && message.pinned) return false;
     if (!config.includeEdited && message.edited_timestamp) return false;
 
@@ -1045,7 +1054,7 @@
     const integerRanges = {
       minMessageAgeHours: [0, 876000],
       maxMessages: [0, 1000000],
-      scanDelayMs: [250, 60000],
+      scanDelayMs: [0, 60000],
       baseDeleteDelayMs: [250, 60000],
       maxAdaptiveDelayMs: [1000, 600000],
       jitterPercent: [0, 50],
@@ -1222,7 +1231,7 @@
       minMessageAgeHours: integer(value('dpe-min-age'), 0, 0, 876000),
       maxMessages: integer(value('dpe-max-messages'), 0, 0, 1000000),
       deleteOrder: value('dpe-order') === 'newest' ? 'newest' : 'oldest',
-      scanDelayMs: integer(value('dpe-scan-delay'), 750, 250, 60000),
+      scanDelayMs: integer(value('dpe-scan-delay'), 250, 0, 60000),
       baseDeleteDelayMs: integer(value('dpe-delete-delay'), 1100, 250, 60000),
       maxAdaptiveDelayMs: integer(value('dpe-max-delay'), 30000, 1000, 600000),
       jitterPercent: integer(value('dpe-jitter'), 15, 0, 50),
@@ -1354,6 +1363,7 @@
         }
         log('info', `Resuming scan before message ${runState.scanCursor || 'latest'}.`);
       }
+      runState.status = runState.anchorFound ? 'scanning' : 'seeking-latest';
       runtime.preflight = false;
 
       savePrefs(config);
@@ -1373,6 +1383,12 @@
           ? 'Default delete-everything scope is active: every message authored by your authenticated account is eligible, including pinned and edited messages.'
           : 'Custom filters are active. Ownership and filter-pass counts will be reported separately.',
       );
+      if (!runState.anchorFound) {
+        log(
+          'info',
+          'Fast-seeking your actual latest message before starting batch 1. No fixed scan delay is added during this seek; Discord rate-limit headers and 429 waits are still enforced.',
+        );
+      }
 
       while (!reachedDateFloor) {
         // A reload can occur after the boundary page was checkpointed but before
@@ -1433,10 +1449,30 @@
         consecutiveEmptyPages = 0;
         runState.scannedPages += 1;
         runState.scannedMessages += messages.length;
-        runState.batchScannedMessages += messages.length;
+        let batchMessages = messages;
+        if (!runState.anchorFound) {
+          const anchorIndex = messages.findIndex(
+            (message) => isAuthoredByUser(message, runState.userId),
+          );
+          if (anchorIndex === -1) {
+            runState.skippedNewerMessages += messages.length;
+            batchMessages = [];
+          } else {
+            runState.anchorFound = true;
+            runState.status = 'scanning';
+            runState.skippedNewerMessages += anchorIndex;
+            batchMessages = messages.slice(anchorIndex);
+            const anchorMessage = messages[anchorIndex];
+            log(
+              'success',
+              `Found your latest message at ${formatDate(anchorMessage.timestamp)} after fast-skipping ${runState.skippedNewerMessages.toLocaleString()} newer combined messages. Batch 1 starts here.`,
+            );
+          }
+        }
+        runState.batchScannedMessages += batchMessages.length;
 
-        for (const message of messages) {
-          if (String(message?.author?.id || '') === String(runState.userId)) {
+        for (const message of batchMessages) {
+          if (isAuthoredByUser(message, runState.userId)) {
             runState.batchOwnedMessages += 1;
           }
           if (matchesMessage(
@@ -1485,10 +1521,17 @@
         else updateUi();
         log(
           'info',
-          `Scanned ${runState.scannedMessages.toLocaleString()} combined messages total; batch ${runState.batchNumber}: ${runState.batchOwnedMessages.toLocaleString()} authored by your account, ${runState.batchFilterMatches.toLocaleString()} passed filters.`,
+          runState.anchorFound
+            ? `Inspected ${runState.scannedMessages.toLocaleString()} combined messages total; batch ${runState.batchNumber}: ${runState.batchScannedMessages.toLocaleString()} anchored messages, ${runState.batchOwnedMessages.toLocaleString()} authored by your account, ${runState.batchFilterMatches.toLocaleString()} passed filters.`
+            : `Fast-seeking your latest message: inspected and skipped ${runState.skippedNewerMessages.toLocaleString()} newer combined messages; none were authored by your account.`,
         );
 
         if (reachedDateFloor) break;
+        if (!runState.anchorFound) {
+          // The request layer already learns Discord's live limit headers and
+          // obeys every 429. Avoid an additional fixed delay while seeking.
+          continue;
+        }
         if (
           runState.batchScannedMessages >= config.scanBatchSize
           && runState.queue.length > 0
@@ -1529,12 +1572,20 @@
       saveRunState();
       if (runState.queue.length > 0) {
         const accountLabel = user.username ? `@${user.username}` : `account ${user.id}`;
+        const anchorSummary = runState.batchNumber === 1
+          ? `started at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages`
+          : `remains anchored below the ${runState.skippedNewerMessages.toLocaleString()} newer messages skipped before batch 1`;
         log(
           'success',
-          `Batch ${runState.batchNumber} ready: ${runState.batchScannedMessages.toLocaleString()} combined channel messages scanned; ${runState.batchOwnedMessages.toLocaleString()} authored by ${accountLabel}; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. Older history has not been scanned yet.`,
+          `Batch ${runState.batchNumber} ready: ${anchorSummary}; ${runState.batchScannedMessages.toLocaleString()} anchored combined messages scanned; ${runState.batchOwnedMessages.toLocaleString()} authored by ${accountLabel}; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. Older history has not been scanned yet.`,
         );
       } else {
-        log('success', 'History scan complete: no additional matching messages remain.');
+        log(
+          'success',
+          runState.anchorFound
+            ? 'History scan complete: no additional matching messages remain.'
+            : `History scan complete: none of the ${runState.scannedMessages.toLocaleString()} inspected messages were authored by the authenticated account.`,
+        );
       }
     } catch (error) {
       if (error instanceof StopSignal) {
@@ -1566,6 +1617,7 @@
       [
         `This permanently deletes ${count.toLocaleString()} messages authored by your account`,
         `from ${formatTarget(runState.target)}.`,
+        `Batch 1 began at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages.`,
         `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
         `After this preview, batches of ${runState.config.scanBatchSize.toLocaleString()} history messages will continue automatically.`,
         '',
@@ -1917,7 +1969,7 @@
         log('info', 'Continuous batching stopped. The checkpoint is still available.');
         return;
       }
-      if (['scanning', 'deleting', 'paused'].includes(runState.status)) {
+      if (['seeking-latest', 'scanning', 'deleting', 'paused'].includes(runState.status)) {
         runState.status = 'stopped';
         saveRunState();
         log('info', 'Checkpoint marked as stopped; it remains available for manual resume.');
@@ -1971,6 +2023,7 @@
     runState.matchedMessages = runState.queue.length;
     runState.batchOwnedMessages = runState.queue.length;
     runState.batchFilterMatches = runState.queue.length;
+    runState.anchorFound = true;
     runState.failed = 0;
     runState.batchProcessed = 0;
     runState.historyComplete = true;
@@ -2031,6 +2084,7 @@
     );
     setText('dpe-status', runtime.paused ? 'paused' : runState.status);
     setText('dpe-batch', runState.batchNumber.toLocaleString());
+    setText('dpe-skipped', runState.skippedNewerMessages.toLocaleString());
     setText('dpe-scanned', runState.scannedMessages.toLocaleString());
     setText('dpe-owned', runState.batchOwnedMessages.toLocaleString());
     setText('dpe-filtered', runState.batchFilterMatches.toLocaleString());
@@ -2365,7 +2419,7 @@
             <details>
               <summary>Reliability & pacing</summary>
               <div class="grid">
-                <label class="field"><span>Scan delay (ms)</span><input id="dpe-scan-delay" type="number" min="250" max="60000"></label>
+                <label class="field"><span>Batch scan delay (ms)</span><input id="dpe-scan-delay" type="number" min="0" max="60000"></label>
                 <label class="field"><span>Base delete delay (ms)</span><input id="dpe-delete-delay" type="number" min="250" max="60000"></label>
                 <label class="field"><span>Maximum adaptive delay (ms)</span><input id="dpe-max-delay" type="number" min="1000" max="600000"></label>
                 <label class="field"><span>Random jitter (%)</span><input id="dpe-jitter" type="number" min="0" max="50"></label>
@@ -2392,10 +2446,10 @@
             <div class="metric"><b id="dpe-failed">0</b><span>Failed</span></div>
             <div class="metric"><b id="dpe-rate-limits">0</b><span>Rate limits</span></div>
           </div>
-          <div class="range">Current batch: <span id="dpe-batch">1</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
+          <div class="range">Current batch: <span id="dpe-batch">1</span> · newer skipped: <span id="dpe-skipped">0</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
           <div class="progress"><div id="dpe-progress-bar"></div></div>
           <div class="hint">Processed: <span id="dpe-progress-text">0%</span></div>
-          <div class="hint">Batch size counts combined messages from everyone. Only messages authored by the authenticated account can be queued.</div>
+          <div class="hint">Before batch 1, a rate-limit-aware fast seek skips newer messages until it finds your latest one. Batch size then counts combined messages from that anchor downward.</div>
 
           <div class="actions">
             <button id="dpe-scan" class="primary" type="button">1. Dry run / scan</button>

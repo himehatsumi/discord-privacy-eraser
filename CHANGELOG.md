@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## 1.4.0 — 2026-07-24
+
+- Added a resumable fast-seek phase that walks backward until it finds the authenticated account's actual latest message.
+- Made batch 1 begin at that owned-message anchor, excluding every newer message from the other participant from its 500-message capacity.
+- Removed the fixed artificial delay while seeking; Discord response headers, proactive cooldowns, 429 `Retry-After`, and retry backoff still govern request speed.
+- Reduced the default post-anchor batch scan delay from 750 ms to 250 ms and allowed a configurable value of 0.
+- Added persisted anchor and skipped-newer counters plus explicit seek, discovery, preview, and confirmation text.
+- Preserved pre-1.4 checkpoint behavior instead of silently re-anchoring an already-reviewed queue.
+- Added integration coverage for a mid-page anchor after hundreds of newer partner messages, exact remaining page capacity, and a no-fixed-delay seek.
+
 ## 1.3.1 — 2026-07-24
 
 - Made the no-filter default mean every message authored by the authenticated account, including pinned and edited messages.

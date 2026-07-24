@@ -21,10 +21,12 @@ for (const [label, pattern] of forbidden) {
 
 const required = [
   ['same-origin API construction', /\$\{location\.origin\}\/api\/v\$\{apiVersion\}\$\{path\}/],
-  ['author identity gate', /String\(message\.author\.id\) !== String\(currentUser\?\.id \|\| ''\)/],
+  ['author identity gate', /function isAuthoredByUser/],
   ['unfiltered default includes pinned messages', /includePinned: true/],
   ['explicit delete-everything scope detector', /function isDeleteEverythingConfig/],
   ['per-batch ownership diagnostics', /batchOwnedMessages/],
+  ['latest-owned-message anchor', /anchorIndex = messages\.findIndex/],
+  ['fast seek remains rate-limit governed', /Avoid an additional fixed delay while seeking/],
   ['target-bound typed confirmation', /const phrase = `DELETE \$\{count\} FROM \$\{runState\.target\.channelId\}`/],
   ['429 handling', /response\.status === 429/],
   ['Retry-After handling', /headers\.get\('Retry-After'\)/],

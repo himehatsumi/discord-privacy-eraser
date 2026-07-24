@@ -38,7 +38,7 @@ The source includes defensive token redaction for local log messages.
 
 Preferences and recovery checkpoints are stored only using the userscript manager's private value storage. There is deliberately no page-readable `localStorage` fallback for settings or deletion queues. If private userscript storage is unavailable or full, the current run may continue in memory, but reload recovery is unavailable.
 
-Version 1.3.1 uses a new preferences key to establish the explicit unfiltered delete-everything default. The older private preference value is not read; existing locked run checkpoints remain separate and retain their original settings.
+Version 1.4 uses a new preferences key to establish the faster batch-scan default. Older private preference values are not read; existing locked run checkpoints remain separate and retain their original settings.
 
 Version 1.1 also removes the two namespaced page-storage keys that version 1.0 could have created when private userscript storage was unavailable. It does not remove or modify Discord's own storage keys.
 
@@ -50,6 +50,7 @@ A checkpoint may contain:
 - Queued message IDs and timestamps.
 - Progress counters and failed message IDs.
 - The current batch number, scan cursor, batch capacity, and whether end-of-history was confirmed.
+- Whether the latest owned-message anchor was found and how many newer messages were skipped before it.
 - A non-cryptographic queue-integrity checksum.
 - Rate-limit deadlines, learned pacing, and recent invalid-request timestamps.
 
