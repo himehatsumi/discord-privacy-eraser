@@ -21,6 +21,8 @@ Changes should be rejected if they introduce any of the following without an exp
 
 - `@require`, `@connect`, remote executable code, `eval`, or `new Function`.
 - Requests to a host other than the active Discord origin.
+- A latest-message search whose author ID, channel ID, guild/DM scope, sort order, or offset differs from the locked run.
+- Trusting a search hit without rechecking its author ID, channel ID, snowflake ID, and timestamp, or failing to fall back safely when search is unavailable or malformed.
 - Token display, copy, export, logging, or persistent storage.
 - Message-content or attachment persistence.
 - Deletion without author-ID verification.
@@ -28,8 +30,10 @@ Changes should be rejected if they introduce any of the following without an exp
 - Removal of the dry run, target lock, or typed confirmation.
 - Continuing an automatically confirmed batch after its account, target, filter signature, or queue-integrity lock changes.
 - Counting or queueing any message newer than the authenticated account's discovered latest-message anchor in a fresh run.
+- Counting a message toward the owned-message batch boundary unless its author ID equals the locked `/users/@me` identity.
+- Persisting matched-message log content in preferences, checkpoints, page storage, files, the clipboard, or network requests.
 - Removal of queue-integrity, strict history-ordering, or invalid-request circuit checks.
-- Removing the batch no-progress guard or allowing a batch request to exceed its configured capacity.
+- Removing the batch no-progress guard or allowing a fresh run to cross its exact owned-message boundary without preserving the next older cursor.
 - Retrying HTTP 429 before Discord's `Retry-After` period has elapsed.
 
 Run `npm test` before every release.

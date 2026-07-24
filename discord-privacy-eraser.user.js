@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.4.0
+// @version      1.5.0
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -35,9 +35,9 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.4.0',
-    prefsKey: 'dpe:prefs:v3',
-    legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2'],
+    version: '1.5.0',
+    prefsKey: 'dpe:prefs:v4',
+    legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3'],
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
     maxLogLines: 180,
@@ -77,6 +77,7 @@
     preflight: false,
     batchLoop: false,
     logs: [],
+    matchLogs: [],
   };
 
   class StopSignal extends Error {
@@ -116,6 +117,8 @@
     stopAfterErrors: 5,
     checkpointEvery: 50,
     scanBatchSize: 500,
+    matchLogMode: 'full',
+    anchorLookupMode: 'search',
     emptyPageConfirmations: 2,
     maxInvalidRequestsPer10Minutes: 20,
     pauseOnNavigate: true,
@@ -376,7 +379,9 @@
       scanCursor: '',
       historyComplete: false,
       anchorFound: false,
+      anchorMethod: '',
       skippedNewerMessages: 0,
+      batchMode: 'owned',
       batchNumber: 1,
       batchScannedMessages: 0,
       batchOwnedMessages: 0,
@@ -411,6 +416,8 @@
       'emptyPageConfirmations',
       'maxInvalidRequestsPer10Minutes',
       'scanBatchSize',
+      'matchLogMode',
+      'anchorLookupMode',
     ]) {
       if (config && config[field] === undefined) {
         addedConfigDefaults[field] = defaultPrefs[field];
@@ -434,6 +441,10 @@
       ...saved,
       config,
       signature,
+      // Checkpoints created before 1.5 keep their reviewed raw-history batch
+      // boundary. A new dry run is required before changing to owned-message
+      // batches so an update never silently expands a confirmed scope.
+      batchMode: saved.batchMode === 'owned' ? 'owned' : 'history',
       anchorFound: saved.anchorFound === undefined
         ? true
         : Boolean(saved.anchorFound),
@@ -456,12 +467,16 @@
           .slice(-1000)
         : [],
     };
-    if ((configWasMigrated || !loaded.queueDigest) && loaded.queue.length > 0) {
+    if (
+      (configWasMigrated || !loaded.queueDigest || saved.batchMode === undefined)
+      && loaded.queue.length > 0
+    ) {
       loaded.queueDigest = computeQueueDigest(
         loaded.queue,
         loaded.target,
         loaded.userId,
         loaded.signature,
+        loaded.batchMode,
       );
     }
     return loaded;
@@ -499,7 +514,13 @@
   function saveRunState() {
     runState.savedAt = Date.now();
     runState.queueDigest = runState.queue.length > 0
-      ? computeQueueDigest(runState.queue, runState.target, runState.userId, runState.signature)
+      ? computeQueueDigest(
+        runState.queue,
+        runState.target,
+        runState.userId,
+        runState.signature,
+        runState.batchMode,
+      )
       : '';
     runState.rateLimitUntil = Math.max(
       Number.isFinite(runState.rateLimitUntil) ? runState.rateLimitUntil : 0,
@@ -525,7 +546,7 @@
   }
 
   function parseTarget() {
-    const match = location.pathname.match(/^\/channels\/([^/]+)\/(\d+)/);
+    const match = location.pathname.match(/^\/channels\/(@me|\d{1,20})\/(\d{1,20})(?:\/|$)/);
     if (!match) return null;
     return {
       guildId: match[1],
@@ -587,11 +608,12 @@
     return fnv1a(JSON.stringify({ config, target, userId }));
   }
 
-  function computeQueueDigest(queue, target, userId, signature) {
+  function computeQueueDigest(queue, target, userId, signature, batchMode = 'history') {
     return fnv1a(JSON.stringify({
       channelId: String(target?.channelId || ''),
       userId: String(userId || ''),
       signature: String(signature || ''),
+      batchMode: String(batchMode || 'history'),
       items: queue.map((item) => [
         String(item?.id || ''),
         String(item?.timestamp || ''),
@@ -616,6 +638,33 @@
     });
     if (runtime.logs.length > SCRIPT.maxLogLines) runtime.logs.shift();
     updateLog();
+  }
+
+  function matchLogText(message, mode) {
+    const prefix = `[${formatDate(message?.timestamp)}] ${String(message?.id || '')}`;
+    if (mode === 'ids') return prefix;
+    const rawContent = String(message?.content || '').replace(/\r\n?/g, '\n');
+    const content = mode === 'preview' && rawContent.length > 300
+        ? `${rawContent.slice(0, 300)}…`
+        : rawContent;
+    const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+    const stickers = Array.isArray(message?.sticker_items) ? message.sticker_items : [];
+    const embeds = Array.isArray(message?.embeds) ? message.embeds : [];
+    const extras = [
+      attachments.length ? `${attachments.length} attachment${attachments.length === 1 ? '' : 's'}` : '',
+      stickers.length ? `${stickers.length} sticker${stickers.length === 1 ? '' : 's'}` : '',
+      embeds.length ? `${embeds.length} embed${embeds.length === 1 ? '' : 's'}` : '',
+    ].filter(Boolean);
+    const body = content || (extras.length ? `[${extras.join(', ')}]` : '[empty message]');
+    return `${prefix} · ${body}`
+      .replace(/mfa\.[\w-]+/gi, '[redacted token]')
+      .replace(/[\w-]{20,}\.[\w-]{4,}\.[\w-]{20,}/g, '[redacted token]');
+  }
+
+  function logMatchedMessage(message, config) {
+    const mode = config?.matchLogMode || defaultPrefs.matchLogMode;
+    if (mode === 'none') return;
+    runtime.matchLogs.push(matchLogText(message, mode));
   }
 
   function wakeRuntime() {
@@ -747,6 +796,23 @@
     if (remaining === 0) saveRunState();
   }
 
+  function isAllowedAuthorSearchPath(path) {
+    const target = runtime.activeTarget || runState.target;
+    const userId = String(currentUser?.id || runState.userId || '');
+    if (!target || !isSnowflake(target.channelId) || !isSnowflake(userId)) return false;
+    const query = new URLSearchParams({
+      author_id: userId,
+      ...(target.guildId === '@me' ? {} : { channel_id: String(target.channelId) }),
+      sort_by: 'timestamp',
+      sort_order: 'desc',
+      offset: '0',
+    });
+    const expected = target.guildId === '@me'
+      ? `/channels/${target.channelId}/messages/search?${query.toString()}`
+      : `/guilds/${target.guildId}/messages/search?${query.toString()}`;
+    return path === expected;
+  }
+
   async function apiRequest(path, options = {}) {
     const {
       method = 'GET',
@@ -760,6 +826,10 @@
       || (
         requestMethod === 'GET'
         && /^\/channels\/\d{1,20}\/messages\?limit=(?:[1-9]|[1-9]\d|100)(?:&before=\d{1,20})?$/.test(path)
+      )
+      || (
+        requestMethod === 'GET'
+        && isAllowedAuthorSearchPath(path)
       )
       || (
         requestMethod === 'DELETE'
@@ -1086,6 +1156,12 @@
     if (!['oldest', 'newest'].includes(config.deleteOrder)) {
       throw new Error('The saved deletion order is invalid.');
     }
+    if (!['none', 'ids', 'preview', 'full'].includes(config.matchLogMode)) {
+      throw new Error('The saved matched-message log mode is invalid.');
+    }
+    if (!['search', 'history'].includes(config.anchorLookupMode)) {
+      throw new Error('The saved latest-message lookup mode is invalid.');
+    }
     if (!config.riskAccepted) {
       throw new Error('Read and accept the irreversible-deletion and account-risk notice first.');
     }
@@ -1180,6 +1256,131 @@
     runState.lastTimestamp = oldestTimestamp;
   }
 
+  function batchCapacityReached(config) {
+    return runState.batchMode === 'owned'
+      ? runState.batchOwnedMessages >= config.scanBatchSize
+      : runState.batchScannedMessages >= config.scanBatchSize;
+  }
+
+  function pageLimitForBatch(config) {
+    if (runState.batchMode === 'owned') return 100;
+    return Math.min(
+      100,
+      Math.max(1, config.scanBatchSize - runState.batchScannedMessages),
+    );
+  }
+
+  function trimToOwnedBatchBoundary(messages, config) {
+    if (runState.batchMode !== 'owned') return messages;
+    let ownedNeeded = Math.max(0, config.scanBatchSize - runState.batchOwnedMessages);
+    if (ownedNeeded === 0) return [];
+    for (let index = 0; index < messages.length; index += 1) {
+      if (!isAuthoredByUser(messages[index], runState.userId)) continue;
+      ownedNeeded -= 1;
+      if (ownedNeeded === 0) return messages.slice(0, index + 1);
+    }
+    return messages;
+  }
+
+  function recordBatchMessage(message, target, config, compiledRegex, excludedTerms) {
+    runState.scannedMessages += 1;
+    runState.batchScannedMessages += 1;
+    if (isAuthoredByUser(message, runState.userId)) {
+      runState.batchOwnedMessages += 1;
+    }
+    if (!matchesMessage(
+      message,
+      config,
+      compiledRegex,
+      excludedTerms,
+      runState.filterReferenceTime,
+    )) {
+      return;
+    }
+    runState.batchFilterMatches += 1;
+    runState.queue.push({
+      id: String(message.id),
+      channelId: String(target.channelId),
+      timestamp: String(message.timestamp || ''),
+    });
+    runState.matchedMessages += 1;
+    if (!runState.firstTimestamp) runState.firstTimestamp = String(message.timestamp || '');
+    runState.lastTimestamp = String(message.timestamp || runState.lastTimestamp);
+    logMatchedMessage(message, config);
+  }
+
+  function extractSearchAnchor(payload, target, userId) {
+    if (!payload || !Array.isArray(payload.messages)) return null;
+    const hits = payload.messages
+      .flatMap((group) => (Array.isArray(group) ? group : []))
+      .filter((message) => message?.hit === true);
+    if (hits.length === 0) return null;
+    if (hits.some((message) => (
+      !isSnowflake(message?.id)
+      || String(message?.channel_id || '') !== String(target.channelId)
+      || !isAuthoredByUser(message, userId)
+      || !Number.isFinite(new Date(message?.timestamp).getTime())
+    ))) {
+      return null;
+    }
+    hits.sort((left, right) => snowflakeCompare(right, left));
+    return hits[0];
+  }
+
+  async function discoverLatestOwnedMessage(target, userId, config) {
+    const query = new URLSearchParams({
+      author_id: String(userId),
+      ...(target.guildId === '@me' ? {} : { channel_id: String(target.channelId) }),
+      sort_by: 'timestamp',
+      sort_order: 'desc',
+      offset: '0',
+    });
+    const scope = target.guildId === '@me'
+      ? `/channels/${target.channelId}/messages/search`
+      : `/guilds/${target.guildId}/messages/search`;
+    const attempts = Math.max(1, Math.min(config.maxRetries, 3));
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      await controlPoint();
+      const response = await apiRequest(
+        `${scope}?${query.toString()}`,
+        { purpose: 'latest-message author lookup' },
+      );
+      const payload = await responseJson(response);
+      if (response.status === 202) {
+        const retrySeconds = Number(payload?.retry_after);
+        const waitMs = Math.max(
+          250,
+          Math.min(60000, Number.isFinite(retrySeconds) ? Math.ceil(retrySeconds * 1000) : 1000),
+        );
+        log(
+          'rate',
+          `Discord is indexing this conversation for the fast author lookup; retrying in ${formatDuration(waitMs)} (${attempt}/${attempts}).`,
+        );
+        await interruptibleSleep(waitMs);
+        continue;
+      }
+      if (!response.ok) {
+        log(
+          'warn',
+          `Fast author lookup returned HTTP ${response.status}; switching to the direct-history fallback.`,
+        );
+        return null;
+      }
+      const anchor = extractSearchAnchor(payload, target, userId);
+      if (anchor) return anchor;
+      log(
+        'warn',
+        'Fast author lookup returned no strictly valid owned-message hit; switching to the direct-history fallback.',
+      );
+      return null;
+    }
+    log(
+      'warn',
+      'Fast author lookup did not finish indexing in time; switching to the direct-history fallback.',
+    );
+    return null;
+  }
+
   function validateQueueTarget(queue, target) {
     if (!target || !isSnowflake(target.channelId)) return false;
     return queue.every((item) => (
@@ -1196,6 +1397,7 @@
       target,
       state.userId,
       state.signature,
+      state.batchMode,
     );
   }
 
@@ -1239,6 +1441,10 @@
       stopAfterErrors: integer(value('dpe-error-stop'), 5, 1, 100),
       checkpointEvery: integer(value('dpe-checkpoint'), 10, 1, 100),
       scanBatchSize: integer(value('dpe-batch-size'), 500, 100, 10000),
+      matchLogMode: ['none', 'ids', 'preview', 'full'].includes(value('dpe-match-log-mode'))
+        ? value('dpe-match-log-mode')
+        : 'full',
+      anchorLookupMode: value('dpe-anchor-mode') === 'history' ? 'history' : 'search',
       emptyPageConfirmations: integer(value('dpe-empty-confirmations'), 2, 1, 5),
       maxInvalidRequestsPer10Minutes: integer(value('dpe-invalid-limit'), 20, 2, 1000),
       pauseOnNavigate: checked('dpe-pause-nav'),
@@ -1278,6 +1484,8 @@
     setValue('dpe-error-stop', prefs.stopAfterErrors);
     setValue('dpe-checkpoint', prefs.checkpointEvery);
     setValue('dpe-batch-size', prefs.scanBatchSize);
+    setValue('dpe-match-log-mode', prefs.matchLogMode);
+    setValue('dpe-anchor-mode', prefs.anchorLookupMode);
     setValue('dpe-empty-confirmations', prefs.emptyPageConfirmations);
     setValue('dpe-invalid-limit', prefs.maxInvalidRequestsPer10Minutes);
     setChecked('dpe-pause-nav', prefs.pauseOnNavigate);
@@ -1343,6 +1551,8 @@
           config,
           filterReferenceTime: runtime.startedAt,
         };
+        runtime.matchLogs = [];
+        updateMatchLog();
       } else if (canContinue) {
         runState.status = 'scanning';
         runState.operation = 'scanning';
@@ -1355,6 +1565,8 @@
         runState.matchedMessages = 0;
         runState.firstTimestamp = '';
         runState.lastTimestamp = '';
+        runtime.matchLogs = [];
+        updateMatchLog();
         log('info', `Starting batch ${runState.batchNumber} before message ${runState.scanCursor}.`);
       } else {
         runState.status = 'scanning';
@@ -1386,8 +1598,41 @@
       if (!runState.anchorFound) {
         log(
           'info',
-          'Fast-seeking your actual latest message before starting batch 1. No fixed scan delay is added during this seek; Discord rate-limit headers and 429 waits are still enforced.',
+          config.anchorLookupMode === 'search'
+            ? 'Finding your actual latest message with Discord’s same-origin author search. The result must match the locked account and channel; otherwise the scanner automatically falls back to direct history.'
+            : 'Fast-seeking your actual latest message through direct history before starting batch 1. No fixed scan delay is added during this seek; Discord rate-limit headers and 429 waits are still enforced.',
         );
+      }
+      log(
+        'info',
+        runState.batchMode === 'owned'
+          ? `Each batch now collects ${config.scanBatchSize.toLocaleString()} messages authored by your account, not ${config.scanBatchSize.toLocaleString()} combined messages from both people.`
+          : 'This older checkpoint retains its previously reviewed combined-history batch boundary. Clear it and start a new dry run to use owned-message batches.',
+      );
+      if (!runState.anchorFound && config.anchorLookupMode === 'search') {
+        const searchAnchor = await discoverLatestOwnedMessage(target, runState.userId, config);
+        if (searchAnchor) {
+          runState.anchorFound = true;
+          runState.anchorMethod = 'search';
+          runState.status = 'scanning';
+          before = String(searchAnchor.id);
+          runState.scanCursor = before;
+          recordBatchMessage(searchAnchor, target, config, compiledRegex, excludedTerms);
+          log(
+            'success',
+            `Found your actual latest message at ${formatDate(searchAnchor.timestamp)} with the fast author-locked lookup. Batch 1 starts at that message; newer messages from the other participant were never walked page by page.`,
+          );
+          if (
+            config.afterDate
+            && new Date(searchAnchor.timestamp).getTime() < new Date(config.afterDate).getTime()
+          ) {
+            reachedDateFloor = true;
+            runState.historyComplete = true;
+          }
+          saveRunState();
+        } else {
+          runState.anchorMethod = 'history';
+        }
       }
 
       while (!reachedDateFloor) {
@@ -1395,15 +1640,15 @@
         // the normal post-page transition ran. Normalize that state before
         // making another request so a completed batch never overshoots.
         if (
-          runState.batchScannedMessages >= config.scanBatchSize
+          batchCapacityReached(config)
           && runState.queue.length > 0
         ) {
           break;
         }
-        if (runState.batchScannedMessages >= config.scanBatchSize) {
+        if (batchCapacityReached(config)) {
           log(
             'info',
-            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} combined messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
+            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} processed messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
           );
           runState.batchNumber += 1;
           runState.batchScannedMessages = 0;
@@ -1411,11 +1656,7 @@
           runState.batchFilterMatches = 0;
         }
         await controlPoint();
-        const remainingInBatch = Math.max(
-          1,
-          config.scanBatchSize - runState.batchScannedMessages,
-        );
-        const pageLimit = Math.min(100, remainingInBatch);
+        const pageLimit = pageLimitForBatch(config);
         const query = new URLSearchParams({ limit: String(pageLimit) });
         if (before) query.set('before', before);
         const response = await apiRequest(
@@ -1448,19 +1689,22 @@
         }
         consecutiveEmptyPages = 0;
         runState.scannedPages += 1;
-        runState.scannedMessages += messages.length;
         let batchMessages = messages;
+        let skippedOnPage = 0;
         if (!runState.anchorFound) {
           const anchorIndex = messages.findIndex(
             (message) => isAuthoredByUser(message, runState.userId),
           );
           if (anchorIndex === -1) {
             runState.skippedNewerMessages += messages.length;
+            runState.scannedMessages += messages.length;
             batchMessages = [];
           } else {
             runState.anchorFound = true;
+            runState.anchorMethod = 'history';
             runState.status = 'scanning';
             runState.skippedNewerMessages += anchorIndex;
+            skippedOnPage = anchorIndex;
             batchMessages = messages.slice(anchorIndex);
             const anchorMessage = messages[anchorIndex];
             log(
@@ -1469,29 +1713,11 @@
             );
           }
         }
-        runState.batchScannedMessages += batchMessages.length;
+        batchMessages = trimToOwnedBatchBoundary(batchMessages, config);
+        runState.scannedMessages += skippedOnPage;
 
         for (const message of batchMessages) {
-          if (isAuthoredByUser(message, runState.userId)) {
-            runState.batchOwnedMessages += 1;
-          }
-          if (matchesMessage(
-            message,
-            config,
-            compiledRegex,
-            excludedTerms,
-            runState.filterReferenceTime,
-          )) {
-            runState.batchFilterMatches += 1;
-            runState.queue.push({
-              id: String(message.id),
-              channelId: String(target.channelId),
-              timestamp: String(message.timestamp || ''),
-            });
-            runState.matchedMessages += 1;
-            if (!runState.firstTimestamp) runState.firstTimestamp = String(message.timestamp || '');
-            runState.lastTimestamp = String(message.timestamp || runState.lastTimestamp);
-          }
+          recordBatchMessage(message, target, config, compiledRegex, excludedTerms);
         }
 
         const remainingAllowance = remainingDeletionAllowance(config);
@@ -1507,8 +1733,10 @@
           runState.queue = prepareQueue(runState.queue, batchConfig);
         }
 
-        const oldest = messages[messages.length - 1];
-        before = nextBefore;
+        const oldest = batchMessages[batchMessages.length - 1] || messages[messages.length - 1];
+        const stoppedAtOwnedBoundary = batchMessages.length > 0
+          && batchMessages.length < messages.length - skippedOnPage;
+        before = stoppedAtOwnedBoundary ? String(oldest.id) : nextBefore;
         runState.scanCursor = before;
         if (config.afterDate) {
           const oldestTimestamp = new Date(oldest.timestamp).getTime();
@@ -1522,7 +1750,7 @@
         log(
           'info',
           runState.anchorFound
-            ? `Inspected ${runState.scannedMessages.toLocaleString()} combined messages total; batch ${runState.batchNumber}: ${runState.batchScannedMessages.toLocaleString()} anchored messages, ${runState.batchOwnedMessages.toLocaleString()} authored by your account, ${runState.batchFilterMatches.toLocaleString()} passed filters.`
+            ? `Inspected ${runState.scannedMessages.toLocaleString()} messages total; batch ${runState.batchNumber}: ${runState.batchScannedMessages.toLocaleString()} processed from the anchor, ${runState.batchOwnedMessages.toLocaleString()} authored by your account, ${runState.batchFilterMatches.toLocaleString()} passed filters.`
             : `Fast-seeking your latest message: inspected and skipped ${runState.skippedNewerMessages.toLocaleString()} newer combined messages; none were authored by your account.`,
         );
 
@@ -1533,15 +1761,15 @@
           continue;
         }
         if (
-          runState.batchScannedMessages >= config.scanBatchSize
+          batchCapacityReached(config)
           && runState.queue.length > 0
         ) {
           break;
         }
-        if (runState.batchScannedMessages >= config.scanBatchSize) {
+        if (batchCapacityReached(config)) {
           log(
             'info',
-            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} combined messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
+            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} processed messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
           );
           runState.batchNumber += 1;
           runState.batchScannedMessages = 0;
@@ -1573,11 +1801,15 @@
       if (runState.queue.length > 0) {
         const accountLabel = user.username ? `@${user.username}` : `account ${user.id}`;
         const anchorSummary = runState.batchNumber === 1
-          ? `started at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages`
-          : `remains anchored below the ${runState.skippedNewerMessages.toLocaleString()} newer messages skipped before batch 1`;
+          ? runState.anchorMethod === 'search'
+            ? 'started at your latest message found by the fast author-locked lookup'
+            : `started at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages`
+          : runState.anchorMethod === 'search'
+            ? 'remains anchored below the latest message found by the fast author-locked lookup'
+            : `remains anchored below the ${runState.skippedNewerMessages.toLocaleString()} newer messages skipped before batch 1`;
         log(
           'success',
-          `Batch ${runState.batchNumber} ready: ${anchorSummary}; ${runState.batchScannedMessages.toLocaleString()} anchored combined messages scanned; ${runState.batchOwnedMessages.toLocaleString()} authored by ${accountLabel}; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. Older history has not been scanned yet.`,
+          `Batch ${runState.batchNumber} ready: ${anchorSummary}; ${runState.batchScannedMessages.toLocaleString()} messages processed; ${runState.batchOwnedMessages.toLocaleString()} authored by ${accountLabel}; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. ${runtime.matchLogs.length.toLocaleString()} matches are displayed in the memory-only matched-message log. Older history has not been scanned yet.`,
         );
       } else {
         log(
@@ -1617,9 +1849,13 @@
       [
         `This permanently deletes ${count.toLocaleString()} messages authored by your account`,
         `from ${formatTarget(runState.target)}.`,
-        `Batch 1 began at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages.`,
+        runState.anchorMethod === 'search'
+          ? 'Batch 1 began at your latest message found by the fast author-locked lookup.'
+          : `Batch 1 began at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages.`,
         `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
-        `After this preview, batches of ${runState.config.scanBatchSize.toLocaleString()} history messages will continue automatically.`,
+        runState.batchMode === 'owned'
+          ? `After this preview, the run continues in batches of ${runState.config.scanBatchSize.toLocaleString()} messages authored by your account.`
+          : `This upgraded checkpoint retains its original ${runState.config.scanBatchSize.toLocaleString()}-history-message batch boundary.`,
         '',
         'Deleted messages cannot be recovered.',
         `Type exactly: ${phrase}`,
@@ -1658,7 +1894,9 @@
     } else {
       log(
         'success',
-        `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}scanning the next ${config.scanBatchSize.toLocaleString()} history messages.`,
+        runState.batchMode === 'owned'
+          ? `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}collecting the next ${config.scanBatchSize.toLocaleString()} messages authored by your account.`
+          : `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}scanning the next ${config.scanBatchSize.toLocaleString()} combined history messages under the preserved checkpoint mode.`,
       );
     }
   }
@@ -2070,6 +2308,17 @@
     output.scrollTop = output.scrollHeight;
   }
 
+  function updateMatchLog() {
+    if (!shadow) return;
+    const output = shadow.getElementById('dpe-match-log');
+    const count = shadow.getElementById('dpe-match-log-count');
+    if (count) count.textContent = runtime.matchLogs.length.toLocaleString();
+    if (!output) return;
+    output.textContent = runtime.matchLogs.length
+      ? runtime.matchLogs.join('\n\n')
+      : 'No matching messages have been found in this batch yet.';
+  }
+
   function updateUi() {
     if (!shadow) return;
     const target = parseTarget();
@@ -2084,7 +2333,12 @@
     );
     setText('dpe-status', runtime.paused ? 'paused' : runState.status);
     setText('dpe-batch', runState.batchNumber.toLocaleString());
-    setText('dpe-skipped', runState.skippedNewerMessages.toLocaleString());
+    setText(
+      'dpe-skipped',
+      runState.anchorMethod === 'search'
+        ? 'fast lookup'
+        : runState.skippedNewerMessages.toLocaleString(),
+    );
     setText('dpe-scanned', runState.scannedMessages.toLocaleString());
     setText('dpe-owned', runState.batchOwnedMessages.toLocaleString());
     setText('dpe-filtered', runState.batchFilterMatches.toLocaleString());
@@ -2149,6 +2403,7 @@
     );
     updateAuthStatus();
     updateLog();
+    updateMatchLog();
   }
 
   function bindUi() {
@@ -2170,7 +2425,9 @@
     on('dpe-retry-failures', 'click', retryFailures);
     on('dpe-clear-log', 'click', () => {
       runtime.logs = [];
+      runtime.matchLogs = [];
       updateLog();
+      updateMatchLog();
     });
     on('dpe-risk', 'change', () => {
       const prefs = readConfigFromUi();
@@ -2322,11 +2579,13 @@
         button.primary { background: #5865f2; }
         button.danger { background: #da373c; }
         button.success { background: #248046; }
-        #dpe-log {
-          max-height: 150px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+        #dpe-log, #dpe-match-log {
+          overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
           margin: 7px 0; padding: 8px; border-radius: 6px; background: #111214;
           color: #b5bac1; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
         }
+        #dpe-log { max-height: 150px; }
+        #dpe-match-log { max-height: 280px; user-select: text; }
         .footer-note { color: #949ba4; font-size: 10px; margin-top: 9px; }
       </style>
       <button id="dpe-launcher" type="button">Privacy Eraser</button>
@@ -2426,7 +2685,23 @@
                 <label class="field"><span>Network / 5xx retries</span><input id="dpe-retries" type="number" min="1" max="50"></label>
                 <label class="field"><span>Pause after consecutive errors</span><input id="dpe-error-stop" type="number" min="1" max="100"></label>
                 <label class="field"><span>Checkpoint every N deletes</span><input id="dpe-checkpoint" type="number" min="1" max="100"></label>
-                <label class="field"><span>Scan, then delete every N history messages</span><input id="dpe-batch-size" type="number" min="100" max="10000" step="100"></label>
+                <label class="field">
+                  <span>Latest-message lookup</span>
+                  <select id="dpe-anchor-mode">
+                    <option value="search">Fast author lookup + safe fallback</option>
+                    <option value="history">Direct history only</option>
+                  </select>
+                </label>
+                <label class="field"><span>Scan, then delete every N of your messages</span><input id="dpe-batch-size" type="number" min="100" max="10000" step="100"></label>
+                <label class="field">
+                  <span>Matched-message log detail</span>
+                  <select id="dpe-match-log-mode">
+                    <option value="full">Full message text</option>
+                    <option value="preview">300-character preview</option>
+                    <option value="ids">Timestamp and ID only</option>
+                    <option value="none">Do not show matches</option>
+                  </select>
+                </label>
                 <label class="field"><span>Confirm empty history pages</span><input id="dpe-empty-confirmations" type="number" min="1" max="5"></label>
                 <label class="field"><span>Invalid requests / 10 min before pause</span><input id="dpe-invalid-limit" type="number" min="2" max="1000"></label>
                 <label class="check"><input id="dpe-pause-nav" type="checkbox"> Pause if I navigate away</label>
@@ -2449,7 +2724,7 @@
           <div class="range">Current batch: <span id="dpe-batch">1</span> · newer skipped: <span id="dpe-skipped">0</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
           <div class="progress"><div id="dpe-progress-bar"></div></div>
           <div class="hint">Processed: <span id="dpe-progress-text">0%</span></div>
-          <div class="hint">Before batch 1, a rate-limit-aware fast seek skips newer messages until it finds your latest one. Batch size then counts combined messages from that anchor downward.</div>
+          <div class="hint">Before batch 1, the default author-locked lookup finds your latest message without walking newer partner messages. If Discord search is unavailable or invalid, it automatically falls back to the rate-limit-aware direct-history seek. The scanner then collects the configured number of messages authored by you.</div>
 
           <div class="actions">
             <button id="dpe-scan" class="primary" type="button">1. Dry run / scan</button>
@@ -2465,6 +2740,10 @@
             <summary>Local activity log</summary>
             <pre id="dpe-log"></pre>
             <button id="dpe-clear-log" type="button">Clear log</button>
+          </details>
+          <details open>
+            <summary>Matched messages in this batch (<span id="dpe-match-log-count">0</span>)</summary>
+            <pre id="dpe-match-log">No matching messages have been found in this batch yet.</pre>
           </details>
           <p class="footer-note">
             No message content, attachments, token, cookies, or logs are transmitted anywhere except the Discord API calls required to scan and delete.

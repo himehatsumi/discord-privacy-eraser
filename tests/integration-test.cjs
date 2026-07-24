@@ -137,6 +137,8 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     stopAfterErrors: 2,
     checkpointEvery: 1,
     scanBatchSize: 500,
+    matchLogMode: 'full',
+    anchorLookupMode: 'history',
     emptyPageConfirmations: 1,
     maxInvalidRequestsPer10Minutes: 20,
     pauseOnNavigate: true,
@@ -144,8 +146,8 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     riskAccepted: true,
     ...prefsOverride,
   };
-  if (!stored.has('dpe:prefs:v3')) {
-    stored.set('dpe:prefs:v3', JSON.stringify(prefs));
+  if (!stored.has('dpe:prefs:v4')) {
+    stored.set('dpe:prefs:v4', JSON.stringify(prefs));
   }
 
   const context = {
@@ -277,6 +279,21 @@ async function testApiAllowlistBindsMethodPathAndBody() {
   await harness.test.apiRequest(
     `/channels/${TARGET_CHANNEL}/messages?limit=50&before=123`,
   );
+  harness.test.setCurrentUser(USER_A);
+  harness.test.setRunState({
+    ...harness.test.emptyRunState(),
+    target: { guildId: '@me', channelId: TARGET_CHANNEL, kind: 'DM / group DM' },
+    userId: USER_A.id,
+  });
+  await harness.test.apiRequest(
+    `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_A.id}&sort_by=timestamp&sort_order=desc&offset=0`,
+  );
+  await assert.rejects(
+    () => harness.test.apiRequest(
+      `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_B.id}&sort_by=timestamp&sort_order=desc&offset=0`,
+    ),
+    /Blocked an unexpected Discord API method, path, or body/,
+  );
   await assert.rejects(
     () => harness.test.apiRequest(
       `/channels/${TARGET_CHANNEL}/messages?limit=101&before=123`,
@@ -285,8 +302,8 @@ async function testApiAllowlistBindsMethodPathAndBody() {
   );
   assert.equal(
     harness.calls.length,
-    1,
-    'only a canonical history request with a limit from 1 through 100 may reach the network',
+    2,
+    'only a canonical history request and the exact account/target-bound author lookup may reach the network',
   );
 }
 
@@ -518,13 +535,14 @@ async function testOldestCapBoundsWorkingQueue() {
 }
 
 async function testContinuousFiveHundredMessageBatches() {
-  const harness = makeHarness({ scanBatchSize: 500 });
+  const harness = makeHarness({ scanBatchSize: 500, text: 'delete-me' });
   const ownIds = new Set(['700', '600', '500', '400', '300', '200']);
   const page = (high) => Array.from({ length: 100 }, (_, index) => {
     const id = String(high - index);
     const item = message({
       id,
-      author: ownIds.has(id) ? USER_A : USER_B,
+      author: USER_A,
+      content: ownIds.has(id) ? 'delete-me' : 'preserve',
       timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
     });
     if (id === '700') {
@@ -563,7 +581,7 @@ async function testContinuousFiveHundredMessageBatches() {
   assert.equal(state.status, 'scanned');
   assert.equal(state.scannedMessages, 500);
   assert.equal(state.historyComplete, false);
-  assert.equal(state.batchOwnedMessages, 5);
+  assert.equal(state.batchOwnedMessages, 500);
   assert.equal(state.batchFilterMatches, 5);
   assert.deepEqual(
     Array.from(state.queue, (item) => item.id),
@@ -589,7 +607,7 @@ async function testCustomBatchNeverOvershoots() {
   const requestedLimits = [];
   const page = (high, count) => Array.from({ length: count }, (_, index) => message({
     id: String(high - index),
-    author: index === 0 ? USER_A : USER_B,
+    author: USER_A,
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
   }));
   harness.setFetchHandler(async ({ url, method }) => {
@@ -604,10 +622,171 @@ async function testCustomBatchNeverOvershoots() {
   harness.test.acceptToken(TOKEN_A);
   await harness.test.startScan();
   const state = harness.test.getRunState();
-  assert.deepEqual(requestedLimits, [100, 50]);
+  assert.deepEqual(requestedLimits, [100, 100]);
   assert.equal(state.scannedMessages, 150);
   assert.equal(state.batchScannedMessages, 150);
   assert.equal(state.status, 'scanned');
+}
+
+async function testOwnedBatchDoesNotStopAtOneMatchInFirstFiveHundredHistoryMessages() {
+  const harness = makeHarness({ scanBatchSize: 100, scanDelayMs: 0, matchLogMode: 'full' });
+  const page = (high, authorForIndex) => Array.from({ length: 100 }, (_, index) => {
+    const id = String(high - index);
+    const author = authorForIndex(index);
+    return message({
+      id,
+      author,
+      content: author.id === USER_A.id ? `owned message ${id}` : `partner message ${id}`,
+      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+    });
+  });
+  const partner = () => USER_B;
+  const pages = new Map([
+    ['', page(1000, (index) => (index === 0 ? USER_A : USER_B))],
+    ['901', page(900, partner)],
+    ['801', page(800, partner)],
+    ['701', page(700, partner)],
+    ['601', page(600, partner)],
+    ['501', page(500, () => USER_A)],
+  ]);
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      const before = historyBefore(url) || '';
+      if (!pages.has(before)) throw new Error(`Unexpected sparse-history cursor ${before}`);
+      return response(pages.get(before));
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  const runtime = harness.test.getRuntime();
+
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.batchOwnedMessages, 100);
+  assert.equal(state.batchFilterMatches, 100);
+  assert.equal(state.queue.length, 100);
+  assert.equal(state.scannedMessages, 599);
+  assert.equal(state.scanCursor, '402');
+  assert.equal(runtime.matchLogs.length, 100);
+  assert.match(runtime.matchLogs[0], /owned message 1000/);
+  assert.match(runtime.matchLogs.at(-1), /owned message 402/);
+}
+
+async function testFastAuthorLookupSnapsToLatestOwnedMessage() {
+  const harness = makeHarness({
+    scanBatchSize: 100,
+    scanDelayMs: 0,
+    anchorLookupMode: 'search',
+  });
+  const anchor = message({
+    id: '1000',
+    content: 'latest owned message',
+    timestamp: '2026-01-01T00:16:40.000Z',
+  });
+  anchor.hit = true;
+  const older = Array.from({ length: 100 }, (_, index) => message({
+    id: String(999 - index),
+    content: `older owned message ${999 - index}`,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 999 - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes('/messages/search?')) {
+      const parsed = new URL(url);
+      assert.equal(parsed.searchParams.get('author_id'), USER_A.id);
+      assert.equal(parsed.searchParams.get('sort_by'), 'timestamp');
+      assert.equal(parsed.searchParams.get('sort_order'), 'desc');
+      assert.equal(parsed.searchParams.get('offset'), '0');
+      return response({ total_results: 100, messages: [[anchor]] });
+    }
+    if (
+      method === 'GET'
+      && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && historyBefore(url) === '1000'
+    ) {
+      return response(older);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.anchorMethod, 'search');
+  assert.equal(state.skippedNewerMessages, 0);
+  assert.equal(state.batchOwnedMessages, 100);
+  assert.equal(state.batchFilterMatches, 100);
+  assert.equal(state.queue.length, 100);
+  assert.equal(state.scannedMessages, 100);
+  assert.equal(state.scanCursor, '901');
+  assert.equal(
+    harness.calls.filter((call) => call.url.includes('/messages/search?')).length,
+    1,
+  );
+  assert.equal(
+    harness.calls.filter(
+      (call) => call.url.includes(`/channels/${TARGET_CHANNEL}/messages?`) && !historyBefore(call.url),
+    ).length,
+    0,
+    'fast lookup must not walk newer combined history before the owned anchor',
+  );
+}
+
+async function testFastAuthorLookupFallsBackOnInvalidHit() {
+  const harness = makeHarness({
+    scanBatchSize: 100,
+    scanDelayMs: 0,
+    anchorLookupMode: 'search',
+  });
+  const invalidHit = message({
+    id: '1000',
+    author: USER_B,
+    timestamp: '2026-01-01T00:16:40.000Z',
+  });
+  invalidHit.hit = true;
+  const directHistory = Array.from({ length: 100 }, (_, index) => message({
+    id: String(900 - index),
+    content: `direct fallback ${900 - index}`,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 900 - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes('/messages/search?')) {
+      return response({ total_results: 1, messages: [[invalidHit]] });
+    }
+    if (
+      method === 'GET'
+      && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && !historyBefore(url)
+    ) {
+      return response(directHistory);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.anchorMethod, 'history');
+  assert.equal(state.batchOwnedMessages, 100);
+  assert.equal(state.queue.length, 100);
+  assert.equal(
+    harness.calls.filter((call) => call.url.includes('/messages/search?')).length,
+    1,
+  );
+  assert.equal(
+    harness.calls.filter(
+      (call) => call.url.includes(`/channels/${TARGET_CHANNEL}/messages?`) && !historyBefore(call.url),
+    ).length,
+    1,
+  );
 }
 
 async function testFirstBatchAnchorsAtLatestOwnedMessage() {
@@ -628,7 +807,7 @@ async function testFirstBatchAnchorsAtLatestOwnedMessage() {
     ['901', page(900, 100)],
     ['801', page(800, 100)],
     ['701', page(700, 100, new Set(['650', '620']))],
-    ['601', page(600, 50, new Set(['600']))],
+    ['601', page(600, 100, new Set(Array.from({ length: 100 }, (_, index) => String(600 - index))))],
   ]);
   const requestedLimits = [];
   harness.setFetchHandler(async ({ url, method }) => {
@@ -649,29 +828,27 @@ async function testFirstBatchAnchorsAtLatestOwnedMessage() {
   assert.equal(state.status, 'scanned');
   assert.equal(state.anchorFound, true);
   assert.equal(state.skippedNewerMessages, 350);
-  assert.equal(state.scannedMessages, 450);
-  assert.equal(state.batchScannedMessages, 100);
-  assert.equal(state.batchOwnedMessages, 3);
-  assert.equal(state.batchFilterMatches, 3);
-  assert.deepEqual(requestedLimits, [100, 100, 100, 100, 50]);
-  assert.deepEqual(
-    Array.from(state.queue, (item) => item.id),
-    ['600', '620', '650'],
-    'batch 1 must begin at the newest owned message and exclude every newer partner message',
-  );
+  assert.equal(state.scannedMessages, 498);
+  assert.equal(state.batchScannedMessages, 148);
+  assert.equal(state.batchOwnedMessages, 100);
+  assert.equal(state.batchFilterMatches, 100);
+  assert.deepEqual(requestedLimits, [100, 100, 100, 100, 100]);
+  assert.equal(state.queue.length, 100);
+  assert.equal(state.queue.at(-1).id, '650');
+  assert.equal(state.scanCursor, '503');
 }
 
 async function testLatestMessageSeekHasNoFixedDelay() {
   const harness = makeHarness({ scanBatchSize: 100, scanDelayMs: 60000 });
-  const page = (high, author) => Array.from({ length: 100 }, (_, index) => message({
+  const page = (high, author, allOwned = false) => Array.from({ length: 100 }, (_, index) => message({
     id: String(high - index),
-    author: index === 0 ? author : USER_B,
+    author: allOwned ? author : (index === 0 ? author : USER_B),
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
   }));
   harness.setFetchHandler(async ({ url, method }) => {
     if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
-      return response(historyBefore(url) ? page(100, USER_A) : page(200, USER_B));
+      return response(historyBefore(url) ? page(100, USER_A, true) : page(200, USER_B));
     }
     throw new Error(`Unexpected ${method} ${url}`);
   });
@@ -759,7 +936,7 @@ async function testCompletedBoundaryCheckpointDoesNotOverscan() {
   let historyRequests = 0;
   const firstPage = Array.from({ length: 100 }, (_, index) => message({
     id: String(100 - index),
-    author: index === 0 ? USER_A : USER_B,
+    author: USER_A,
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 100 - index)).toISOString(),
   }));
   harness.setFetchHandler(async ({ url, method }) => {
@@ -785,14 +962,15 @@ async function testCompletedBoundaryCheckpointDoesNotOverscan() {
   const state = harness.test.getRunState();
   assert.equal(historyRequests, 1);
   assert.equal(state.status, 'scanned');
-  assert.deepEqual(Array.from(state.queue, (item) => item.id), ['100']);
+  assert.equal(state.queue.length, 100);
+  assert.equal(state.queue.at(-1).id, '100');
 }
 
 async function testEmptyDeletionCheckpointAdvancesSafely() {
   const harness = makeHarness({ scanBatchSize: 100 });
   const firstPage = Array.from({ length: 100 }, (_, index) => message({
     id: String(100 - index),
-    author: index === 0 ? USER_A : USER_B,
+    author: USER_A,
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 100 - index)).toISOString(),
   }));
   harness.setFetchHandler(async ({ url, method }) => {
@@ -846,6 +1024,10 @@ async function testCompactCheckpointRestoresLockedChannel() {
   delete serialized.config.emptyPageConfirmations;
   delete serialized.config.maxInvalidRequestsPer10Minutes;
   delete serialized.config.scanBatchSize;
+  delete serialized.config.matchLogMode;
+  delete serialized.config.anchorLookupMode;
+  delete serialized.batchMode;
+  delete serialized.anchorMethod;
   delete serialized.historyComplete;
   serialized.signature = first.test.configSignature(
     serialized.config,
@@ -864,6 +1046,9 @@ async function testCompactCheckpointRestoresLockedChannel() {
   assert.equal(restored.config.emptyPageConfirmations, 2);
   assert.equal(restored.config.maxInvalidRequestsPer10Minutes, 20);
   assert.equal(restored.config.scanBatchSize, 500);
+  assert.equal(restored.config.matchLogMode, 'full');
+  assert.equal(restored.config.anchorLookupMode, 'search');
+  assert.equal(restored.batchMode, 'history');
   assert.equal(
     restored.historyComplete,
     true,
@@ -1338,6 +1523,9 @@ async function main() {
   await testOldestCapBoundsWorkingQueue();
   await testContinuousFiveHundredMessageBatches();
   await testCustomBatchNeverOvershoots();
+  await testOwnedBatchDoesNotStopAtOneMatchInFirstFiveHundredHistoryMessages();
+  await testFastAuthorLookupSnapsToLatestOwnedMessage();
+  await testFastAuthorLookupFallsBackOnInvalidHit();
   await testFirstBatchAnchorsAtLatestOwnedMessage();
   await testLatestMessageSeekHasNoFixedDelay();
   await testLatestMessageSeekCompletesWhenNoOwnedMessageExists();

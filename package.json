@@ -1,15 +1,24 @@
 {
   "name": "discord-privacy-eraser",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "A safety-focused userscript for deleting only your own messages in the current Discord channel or DM.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/himehatsumi/discord-privacy-eraser.git"
+  },
+  "homepage": "https://github.com/himehatsumi/discord-privacy-eraser#readme",
+  "bugs": {
+    "url": "https://github.com/himehatsumi/discord-privacy-eraser/issues"
+  },
   "license": "MIT",
   "scripts": {
     "check": "node --check discord-privacy-eraser.user.js",
     "test:smoke": "node tests/smoke-test.cjs",
     "test:integration": "node tests/integration-test.cjs",
     "test:security": "node tests/security-check.cjs",
-    "test": "npm run check && npm run test:smoke && npm run test:integration && npm run test:security"
+    "test:release": "node tests/release-check.cjs",
+    "test": "npm run check && npm run test:smoke && npm run test:integration && npm run test:security && npm run test:release"
   },
   "engines": {
     "node": ">=20"

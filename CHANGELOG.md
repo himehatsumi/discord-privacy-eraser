@@ -2,6 +2,21 @@
 
 All notable changes are documented here.
 
+## [1.5.0](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.5.0) — 2026-07-24
+
+- Changed fresh-run batch capacity from combined channel history to messages authored by the authenticated account: the default batch now collects 500 of your messages before deletion.
+- Fixed the sparse-history failure where the scanner stopped with one match merely because the first 500 combined messages contained only one message from you.
+- Added a same-origin author search that snaps directly to the authenticated account's newest message in the locked channel or DM, with bounded retries while Discord indexes the conversation.
+- Locked the fast lookup to the current account, target, newest-first sort, and zero offset; every returned hit is revalidated before it can anchor a batch.
+- Added automatic direct-history fallback when Discord search is unavailable, still indexing, rate limited beyond its retry budget, empty, or malformed.
+- Kept direct, newest-to-oldest channel pagination after the anchor and exact mid-page owned-message boundaries, so the next batch neither skips nor duplicates older history.
+- Kept pre-1.5 checkpoints on their previously reviewed combined-history boundary; clearing the checkpoint and starting a new dry scan is required to adopt the expanded owned-message scope.
+- Added a separate memory-only matched-message log that displays every filter match in the current batch.
+- Added configurable full-text, 300-character preview, timestamp/ID-only, and disabled match-log modes; full text is the new-run default.
+- Kept message text out of preferences, checkpoints, files, clipboard operations, and third-party requests.
+- Added regression coverage for a first 500-message window with only one owned message, exact owned-message boundary cursors, and complete matched-message log output.
+- Refreshed installation, upgrade, privacy, security, and release documentation and added a packaged userscript asset to the current GitHub release.
+
 ## 1.4.0 — 2026-07-24
 
 - Added a resumable fast-seek phase that walks backward until it finds the authenticated account's actual latest message.
