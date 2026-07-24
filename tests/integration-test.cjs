@@ -1688,7 +1688,7 @@ function testFilterMatrix() {
       new Date('2020-01-01T02:00:00.000Z').getTime(),
     ),
     true,
-    'age filtering should use the dry-run reference time instead of wall-clock drift',
+    'age filtering should use the scan reference time instead of wall-clock drift',
   );
 }
 

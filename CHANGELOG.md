@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## [1.6.3](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.3) — 2026-07-24
+
+- Finished the one-button workflow documentation after successful live use.
+- Replaced remaining user-facing “dry run” terminology with “scan” or “scanned queue,” matching the actual scan → confirm → delete → repeat flow.
+- Clarified that **Preview next batch** is optional while the mandatory pre-deletion scan and exact confirmation remain enforced inside the recommended cleanup button.
+- Refreshed README, privacy, security-test terminology, package metadata, and release documentation without changing deletion scope or weakening any safety gate.
+
 ## [1.6.2](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.2) — 2026-07-24
 
 - Added a prominent single cleanup button that scans one bounded batch, hands it directly to the existing exact-phrase confirmation, deletes it, and automatically repeats scan → delete until completion.

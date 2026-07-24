@@ -45,7 +45,7 @@ const required = [
   ['429 handling', /response\.status === 429/],
   ['Retry-After handling', /headers\.get\('Retry-After'\)/],
   ['Retry-After hard minimum', /minimumWait \+ 250 \+ positiveJitter/],
-  ['dry-run target lock', /runState\.signature !== expectedSignature/],
+  ['pre-deletion scan target lock', /runState\.signature !== expectedSignature/],
   ['fresh identity verification', /resolveCurrentUser\(\{ force: true \}\)/],
   ['mid-run account-switch stop', /The signed-in Discord account changed/],
   ['locked-channel queue validation', /validateQueueIntegrity\(runState, target\)/],

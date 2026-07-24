@@ -45,6 +45,8 @@ Version 1.6 adds a queue-eligibility version. Checkpoints created before the doc
 
 Version 1.6.2 starts private preferences generation v5 to make newest-first the fresh-run default. Active checkpoints retain their exact settings and order independently of this preference change.
 
+Version 1.6.3 standardizes the interface and documentation on “pre-deletion scan” terminology. This is a wording change only: the single-button workflow still reads a bounded queue from Discord, displays its matches, and requires confirmation before its first DELETE request.
+
 Version 1.1 also removes the two namespaced page-storage keys that version 1.0 could have created when private userscript storage was unavailable. It does not remove or modify Discord's own storage keys.
 
 A checkpoint may contain:

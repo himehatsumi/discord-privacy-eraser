@@ -4,6 +4,8 @@
 
 [Latest release](https://github.com/himehatsumi/discord-privacy-eraser/releases/latest) · [Changelog](CHANGELOG.md) · [Privacy](PRIVACY.md) · [Security](SECURITY.md)
 
+The finished default workflow is **newest-first** and uses one button to scan 500 of your deletable messages, confirm the first bounded queue, delete it, and repeat automatically. The separate preview controls are optional.
+
 ## Important warning
 
 Discord says [automating a normal user account is prohibited self-botting](https://support.discord.com/hc/en-us/articles/115002192352-Automated-User-Accounts-Self-Bots) and may result in account termination. This script reduces operational risk by using conservative, adaptive pacing, but it cannot remove that policy risk.
@@ -93,6 +95,8 @@ Version 1.6 introduces a new queue-eligibility version. Pre-1.6 checkpoints are 
 Version 1.6.1 preserves valid v1.6.0 queues. Confirmation now stays inside the userscript panel instead of relying on a browser prompt after asynchronous account validation.
 
 Version 1.6.2 adds the recommended single-button scan/delete loop and starts a new preferences generation whose fresh default is newest-first. An active checkpoint still loads its exact reviewed order and settings; finish or clear it before starting with the new defaults.
+
+Version 1.6.3 is the finished terminology and documentation pass. The safety stage is consistently called a pre-deletion scan, making it clear that the recommended one-button workflow does not require a separate preview action and still never sends DELETE before confirmation.
 
 ## Recovery behavior
 

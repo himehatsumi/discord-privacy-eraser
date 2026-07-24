@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.6.2
+// @version      1.6.3
 // @description  Safely scan and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -36,7 +36,7 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.6.2',
+    version: '1.6.3',
     prefsKey: 'dpe:prefs:v5',
     legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3', 'dpe:prefs:v4'],
     runKey: 'dpe:run:v1',
@@ -1339,10 +1339,10 @@
       'riskAccepted',
     ];
     if (stringFields.some((field) => typeof config[field] !== 'string')) {
-      throw new Error('One or more saved text settings are invalid. Start a new dry run.');
+      throw new Error('One or more saved text settings are invalid. Start a new scan.');
     }
     if (booleanFields.some((field) => typeof config[field] !== 'boolean')) {
-      throw new Error('One or more saved toggle settings are invalid. Start a new dry run.');
+      throw new Error('One or more saved toggle settings are invalid. Start a new scan.');
     }
     const integerRanges = {
       minMessageAgeHours: [0, 876000],
@@ -1848,7 +1848,7 @@
 
       if ((resume && !canResume) || (continuation && !canContinue)) {
         throw new FatalApiError(
-          'The signed-in account, target, saved settings, or batch checkpoint changed. Start a new dry run instead.',
+          'The signed-in account, target, saved settings, or batch checkpoint changed. Start a new scan instead.',
         );
       }
 
@@ -1900,7 +1900,7 @@
 
       log(
         'info',
-        `Dry run started for ${formatTarget(target)}. No messages will be deleted during scanning.`,
+        `Scan started for ${formatTarget(target)}. No messages will be deleted until the scanned queue is confirmed.`,
       );
       log(
         'info',
@@ -1920,7 +1920,7 @@
         'info',
         runState.batchMode === 'owned'
           ? `Each batch collects ${config.scanBatchSize.toLocaleString()} deletable messages authored by your account. Undeletable call/system entries are ignored, and empty 100-message windows use a locked author-search jump.`
-          : 'This older checkpoint retains its previously reviewed combined-history batch boundary. Clear it and start a new dry run to use owned-message batches.',
+          : 'This older checkpoint retains its previously reviewed combined-history batch boundary. Clear it and start a new scan to use owned-message batches.',
       );
       if (!runState.anchorFound && config.anchorLookupMode === 'search') {
         const searchAnchor = await discoverLatestOwnedMessage(target, runState.userId, config);
@@ -2308,7 +2308,7 @@
         `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
         `Deletion order: ${runState.config.deleteOrder} first. The first request targets ${formatDate(runState.queue[0]?.timestamp)}.`,
         runState.batchMode === 'owned'
-          ? `After this preview, the run continues in batches of ${runState.config.scanBatchSize.toLocaleString()} deletable messages authored by your account; call/system entries never consume capacity.`
+          ? `After this scanned batch, the run continues in batches of ${runState.config.scanBatchSize.toLocaleString()} deletable messages authored by your account; call/system entries never consume capacity.`
           : `This upgraded checkpoint retains its original ${runState.config.scanBatchSize.toLocaleString()}-history-message batch boundary.`,
         '',
         'Deleted messages cannot be recovered.',
@@ -2449,12 +2449,12 @@
         hasConfig: Boolean(config),
         queueCount: runState.queue.length,
       });
-      log('error', 'There is no non-empty dry-run queue to delete.');
+      log('error', 'There is no non-empty scanned queue to delete.');
       return;
     }
     if (!sameTarget(parseTarget(), target)) {
       debugLog('deletion-blocked', { reason: 'open-target-mismatch' });
-      log('error', 'Return to the exact channel/DM used for the dry run before deleting.');
+      log('error', 'Return to the exact channel/DM used for the scan before deleting.');
       return;
     }
     if (!validateQueueIntegrity(runState, target)) {
@@ -2474,7 +2474,7 @@
       const user = await resolveCurrentUser({ force: true });
       const expectedSignature = configSignature(config, target, user.id);
       if (runState.signature !== expectedSignature || runState.userId !== user.id) {
-        throw new Error('The target, signed-in account, or filters changed. Run a new dry run.');
+        throw new Error('The target, signed-in account, or filters changed. Run a new scan.');
       }
       debugLog('deletion-preflight-passed', {
         authenticatedUser: debugId(user.id),
@@ -2513,7 +2513,7 @@
     saveRunState();
     log(
       auto ? 'warn' : 'info',
-      `${auto ? 'Auto-resumed' : 'Started'} permanent deletion of the locked dry-run queue. ${config.deleteOrder === 'oldest' ? 'Oldest' : 'Newest'} first; the first request targets ${formatDate(runState.queue[0]?.timestamp)}.`,
+      `${auto ? 'Auto-resumed' : 'Started'} permanent deletion of the locked scanned queue. ${config.deleteOrder === 'oldest' ? 'Oldest' : 'Newest'} first; the first request targets ${formatDate(runState.queue[0]?.timestamp)}.`,
     );
     debugLog('deletion-started', {
       queueCount: runState.queue.length,
@@ -2938,7 +2938,7 @@
     } else if (runState.operation === 'scanning') {
       await startScan({ resume: true });
     } else if (runState.operation === 'deleting' || runState.operation === 'batching') {
-      log('error', 'This deletion checkpoint was never confirmed. Run a new dry run.');
+      log('error', 'This deletion checkpoint was never confirmed. Run a new scan.');
     }
   }
 
