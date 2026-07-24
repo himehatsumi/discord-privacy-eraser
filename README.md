@@ -34,11 +34,13 @@ For a very long history, leave the tab open. Pausing or stopping preserves a che
 
 - Current channel or DM only; no server-wide or all-DM mode.
 - Every candidate must have an author ID equal to `/users/@me`.
+- Every queued message ID and history cursor must be a valid Discord snowflake from the locked channel.
 - The signed-in identity is rechecked before deletion; an account change stops the run before another message is touched.
 - Dry run and typed confirmation are mandatory before a new deletion.
 - Pinned messages are protected by default.
 - Navigation away pauses the run by default.
 - No remote dependencies, update URL, telemetry, attachment downloads, or third-party requests.
+- A method-and-path allowlist permits only identity/history reads and deletion of a single queued message.
 - The Discord authorization token is held only in memory and never shown, logged, copied, exported, or persisted.
 - Checkpoints store only settings, target/message IDs, timestamps, and counters in userscript-manager storage.
 
@@ -78,6 +80,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
+- Mocked end-to-end scans and deletions covering filters, queue ordering, account changes, malformed history, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 
 GitHub Actions runs the same checks on every push and pull request.

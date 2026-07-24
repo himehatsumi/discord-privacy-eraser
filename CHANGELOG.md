@@ -2,6 +2,18 @@
 
 All notable changes are documented here.
 
+## 1.1.0 — 2026-07-24
+
+- Added mocked end-to-end coverage for scans, filters, capped queue ordering, deletion, rate-limit recovery, authentication failure, account switching, malformed history, and corrupted queues.
+- Bound the network allowlist to exact HTTP method/path pairs and disallowed request bodies.
+- Restricted credential observation to same-origin Discord API requests and explicit supported Discord hosts.
+- Added strict queue/channel/snowflake validation and fail-closed pagination guards.
+- Added safe-range validation for resumed settings and pacing controls.
+- Fixed capped dry runs reporting dates from discarded matches instead of the selected queue.
+- Made HTTP 401 failures pause immediately instead of entering the normal deletion retry loop.
+- Ensured Retry-After and base deletion delays can never be shortened by random jitter.
+- Removed the page-readable checkpoint fallback and added cleanup of its legacy namespaced keys.
+
 ## 1.0.0 — 2026-07-24
 
 - Added current-channel and DM history scanning with local author verification.

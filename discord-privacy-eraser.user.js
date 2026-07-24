@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.0.0
+// @version      1.1.0
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
-// @match        https://*.discord.com/channels/*
+// @match        https://canary.discord.com/channels/*
+// @match        https://ptb.discord.com/channels/*
 // @run-at       document-start
 // @noframes
 // @grant        unsafeWindow
@@ -34,10 +35,10 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.0.0',
+    version: '1.1.0',
     prefsKey: 'dpe:prefs:v1',
     runKey: 'dpe:run:v1',
-    apiVersions: ['9', '10'],
+    apiVersions: ['10', '9'],
     maxLogLines: 180,
     maxSavedFailures: 2000,
   });
@@ -56,6 +57,7 @@
   let autoResumeTimer = null;
   let autoResumeInterval = null;
   let lastKnownUrl = location.href;
+  let storageWarningShown = false;
 
   const runtime = {
     mode: 'idle',
@@ -175,14 +177,27 @@
     } catch {}
   }
 
+  function isSameOriginDiscordApi(input) {
+    try {
+      const rawUrl = typeof input === 'string' ? input : input?.url;
+      if (!rawUrl) return false;
+      const url = new URL(rawUrl, location.origin);
+      return url.origin === location.origin && url.pathname.startsWith('/api/');
+    } catch {
+      return false;
+    }
+  }
+
   function installCredentialSniffer() {
     try {
       const originalFetch = pageWindow.fetch;
       if (typeof originalFetch === 'function' && !originalFetch.__dpeWrapped) {
         const wrappedFetch = function (...args) {
           try {
-            sniffHeaders(args[0]?.headers);
-            sniffHeaders(args[1]?.headers);
+            if (isSameOriginDiscordApi(args[0])) {
+              sniffHeaders(args[0]?.headers);
+              sniffHeaders(args[1]?.headers);
+            }
           } catch {}
           return originalFetch.apply(this, args);
         };
@@ -290,11 +305,7 @@
       const value = GM_getValue(key);
       return value === undefined ? fallback : parseJson(value, fallback);
     } catch {
-      try {
-        return parseJson(localStorage.getItem(key), fallback);
-      } catch {
-        return fallback;
-      }
+      return fallback;
     }
   }
 
@@ -304,23 +315,30 @@
       GM_setValue(key, serialized);
       return true;
     } catch {
-      try {
-        localStorage.setItem(key, serialized);
-        return true;
-      } catch {
-        log('warn', 'Checkpoint storage is full; the run can continue, but reload recovery is unavailable.');
-        return false;
+      if (!storageWarningShown) {
+        storageWarningShown = true;
+        log('warn', 'Private checkpoint storage is unavailable or full; the run can continue, but reload recovery is unavailable.');
       }
+      return false;
     }
   }
 
   function storageDelete(key) {
     try {
       GM_deleteValue(key);
-    } catch {
-      try { localStorage.removeItem(key); } catch {}
-    }
+    } catch {}
   }
+
+  function removeLegacyPageState() {
+    // Version 1.0 could fall back to Discord-origin localStorage if private
+    // userscript storage failed. Remove only this script's old namespaced keys.
+    try {
+      pageWindow.localStorage?.removeItem(SCRIPT.prefsKey);
+      pageWindow.localStorage?.removeItem(SCRIPT.runKey);
+    } catch {}
+  }
+
+  removeLegacyPageState();
 
   function loadPrefs() {
     const saved = storageGet(SCRIPT.prefsKey, {});
@@ -581,6 +599,23 @@
       purpose = 'request',
       maxRetries = runState.config?.maxRetries ?? defaultPrefs.maxRetries,
     } = options;
+    const requestMethod = String(method).toUpperCase();
+    const allowedRequest = body === null && (
+      (requestMethod === 'GET' && path === '/users/@me')
+      || (
+        requestMethod === 'GET'
+        && /^\/channels\/\d{1,20}\/messages\?limit=100(?:&before=\d{1,20})?$/.test(path)
+      )
+      || (
+        requestMethod === 'DELETE'
+        && /^\/channels\/\d{1,20}\/messages\/\d{1,20}$/.test(path)
+      )
+    );
+    if (!allowedRequest) {
+      throw new FatalApiError(
+        'Blocked an unexpected Discord API method, path, or body before sending it.',
+      );
+    }
     const token = await waitForAuth();
     let transientAttempt = 0;
 
@@ -605,7 +640,7 @@
         response = await nativeFetch(
           `${location.origin}/api/v${apiVersion}${path}`,
           {
-            method,
+            method: requestMethod,
             headers,
             body: body === null ? undefined : JSON.stringify(body),
             credentials: 'include',
@@ -628,7 +663,7 @@
         runtime.requestController = null;
       }
 
-      learnRateLimitHeaders(response, method);
+      learnRateLimitHeaders(response, requestMethod);
 
       if (response.status === 429) {
         const payload = await responseJson(response);
@@ -782,6 +817,57 @@
   }
 
   function validateConfig(config) {
+    if (!config || typeof config !== 'object') {
+      throw new Error('The saved settings are missing or invalid.');
+    }
+    const stringFields = ['afterDate', 'beforeDate', 'text', 'excludeTerms'];
+    const booleanFields = [
+      'regex',
+      'caseSensitive',
+      'includePinned',
+      'includeEdited',
+      'pauseOnNavigate',
+      'autoResume',
+      'riskAccepted',
+    ];
+    if (stringFields.some((field) => typeof config[field] !== 'string')) {
+      throw new Error('One or more saved text settings are invalid. Start a new dry run.');
+    }
+    if (booleanFields.some((field) => typeof config[field] !== 'boolean')) {
+      throw new Error('One or more saved toggle settings are invalid. Start a new dry run.');
+    }
+    const integerRanges = {
+      minMessageAgeHours: [0, 876000],
+      maxMessages: [0, 1000000],
+      scanDelayMs: [250, 60000],
+      baseDeleteDelayMs: [250, 60000],
+      maxAdaptiveDelayMs: [1000, 600000],
+      jitterPercent: [0, 50],
+      maxRetries: [1, 50],
+      stopAfterErrors: [1, 100],
+      checkpointEvery: [1, 100],
+    };
+    for (const [field, [minimum, maximum]] of Object.entries(integerRanges)) {
+      if (
+        !Number.isInteger(config[field])
+        || config[field] < minimum
+        || config[field] > maximum
+      ) {
+        throw new Error(`The saved “${field}” setting is outside its safe range.`);
+      }
+    }
+    if (config.maxAdaptiveDelayMs < config.baseDeleteDelayMs) {
+      throw new Error('Maximum adaptive delay must be at least the base deletion delay.');
+    }
+    if (!['any', 'with', 'without', 'images', 'nonimages'].includes(config.attachmentMode)) {
+      throw new Error('The saved attachment filter is invalid.');
+    }
+    if (!['any', 'with', 'without'].includes(config.linkMode)) {
+      throw new Error('The saved link filter is invalid.');
+    }
+    if (!['oldest', 'newest'].includes(config.deleteOrder)) {
+      throw new Error('The saved deletion order is invalid.');
+    }
     if (!config.riskAccepted) {
       throw new Error('Read and accept the irreversible-deletion and account-risk notice first.');
     }
@@ -813,6 +899,10 @@
     }
   }
 
+  function isSnowflake(value) {
+    return /^\d{1,20}$/.test(String(value || ''));
+  }
+
   function prepareQueue(queue, config) {
     const deduplicated = [...new Map(queue.map((item) => [item.id, item])).values()];
     deduplicated.sort(snowflakeCompare);
@@ -820,6 +910,36 @@
     return config.maxMessages > 0
       ? deduplicated.slice(0, config.maxMessages)
       : deduplicated;
+  }
+
+  function updateQueueRange() {
+    let oldestTime = Number.POSITIVE_INFINITY;
+    let newestTime = Number.NEGATIVE_INFINITY;
+    let oldestTimestamp = '';
+    let newestTimestamp = '';
+    for (const item of runState.queue) {
+      const time = new Date(item.timestamp).getTime();
+      if (!Number.isFinite(time)) continue;
+      if (time < oldestTime) {
+        oldestTime = time;
+        oldestTimestamp = item.timestamp;
+      }
+      if (time > newestTime) {
+        newestTime = time;
+        newestTimestamp = item.timestamp;
+      }
+    }
+    runState.firstTimestamp = newestTimestamp;
+    runState.lastTimestamp = oldestTimestamp;
+  }
+
+  function validateQueueTarget(queue, target) {
+    if (!target || !isSnowflake(target.channelId)) return false;
+    return queue.every((item) => (
+      item
+      && isSnowflake(item.id)
+      && String(item.channelId || '') === String(target.channelId)
+    ));
   }
 
   function readConfigFromUi() {
@@ -974,10 +1094,17 @@
         runState.scannedMessages += messages.length;
 
         for (const message of messages) {
+          if (
+            !isSnowflake(message?.id)
+            || String(message?.channel_id || '') !== String(target.channelId)
+          ) {
+            log('warn', 'Ignored a malformed history item or one outside the locked target.');
+            continue;
+          }
           if (matchesMessage(message, config, compiledRegex, excludedTerms)) {
             runState.queue.push({
               id: String(message.id),
-              channelId: String(message.channel_id || target.channelId),
+              channelId: String(target.channelId),
               timestamp: String(message.timestamp || ''),
             });
             runState.matchedMessages += 1;
@@ -987,7 +1114,16 @@
         }
 
         const oldest = messages[messages.length - 1];
-        before = String(oldest.id);
+        const nextBefore = String(oldest?.id || '');
+        if (
+          !isSnowflake(nextBefore)
+          || (before && BigInt(nextBefore) >= BigInt(before))
+        ) {
+          throw new FatalApiError(
+            'Discord returned an invalid or repeating history cursor. The scan was paused safely.',
+          );
+        }
+        before = nextBefore;
         runState.scanCursor = before;
         if (config.afterDate) {
           const oldestTimestamp = new Date(oldest.timestamp).getTime();
@@ -1012,6 +1148,7 @@
       }
 
       runState.queue = prepareQueue(runState.queue, config);
+      updateQueueRange();
       runState.initialMatches = runState.queue.length;
       runState.matchedMessages = runState.queue.length;
       runState.status = 'scanned';
@@ -1084,6 +1221,10 @@
       log('error', 'Return to the exact channel/DM used for the dry run before deleting.');
       return;
     }
+    if (!validateQueueTarget(runState.queue, target)) {
+      log('error', 'The saved queue failed its locked-channel integrity check. Run a new dry scan.');
+      return;
+    }
 
     try {
       validateConfig(config);
@@ -1144,6 +1285,7 @@
           );
         } catch (error) {
           if (error instanceof StopSignal) throw error;
+          if (error instanceof FatalApiError) throw error;
           consecutiveErrors += 1;
           log('error', `Delete ${message.id} failed: ${error.message}`);
           if (consecutiveErrors >= config.stopAfterErrors) {
@@ -1326,8 +1468,7 @@
     runState.deleted = 0;
     runState.alreadyGone = 0;
     runState.failed = 0;
-    runState.firstTimestamp = runState.queue.at(-1)?.timestamp || '';
-    runState.lastTimestamp = runState.queue[0]?.timestamp || '';
+    updateQueueRange();
     runState.status = 'scanned';
     runState.operation = '';
     runState.confirmed = false;

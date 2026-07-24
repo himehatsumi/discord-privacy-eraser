@@ -19,5 +19,5 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Run syntax, smoke, and security checks
+      - name: Run syntax, integration, and security checks
         run: npm test
