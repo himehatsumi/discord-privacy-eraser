@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.2.0
+// @version      1.3.0
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -35,7 +35,7 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.2.0',
+    version: '1.3.0',
     prefsKey: 'dpe:prefs:v1',
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
@@ -74,6 +74,7 @@
     requestController: null,
     activeTarget: null,
     preflight: false,
+    batchLoop: false,
     logs: [],
   };
 
@@ -113,6 +114,7 @@
     maxRetries: 12,
     stopAfterErrors: 5,
     checkpointEvery: 50,
+    scanBatchSize: 500,
     emptyPageConfirmations: 2,
     maxInvalidRequestsPer10Minutes: 20,
     pauseOnNavigate: true,
@@ -368,6 +370,10 @@
       queueDigest: '',
       failures: [],
       scanCursor: '',
+      historyComplete: false,
+      batchNumber: 1,
+      batchScannedMessages: 0,
+      batchProcessed: 0,
       scannedPages: 0,
       scannedMessages: 0,
       matchedMessages: 0,
@@ -393,12 +399,17 @@
     let config = saved.config;
     let signature = saved.signature;
     const addedConfigDefaults = {};
-    for (const field of ['emptyPageConfirmations', 'maxInvalidRequestsPer10Minutes']) {
+    for (const field of [
+      'emptyPageConfirmations',
+      'maxInvalidRequestsPer10Minutes',
+      'scanBatchSize',
+    ]) {
       if (config && config[field] === undefined) {
         addedConfigDefaults[field] = defaultPrefs[field];
       }
     }
-    if (config && Object.keys(addedConfigDefaults).length > 0) {
+    const configWasMigrated = config && Object.keys(addedConfigDefaults).length > 0;
+    if (configWasMigrated) {
       config = { ...config, ...addedConfigDefaults };
       signature = configSignature(config, saved.target, saved.userId);
     }
@@ -415,6 +426,12 @@
       ...saved,
       config,
       signature,
+      // Pre-1.3 runs were single-queue workflows. Treat their completed scan
+      // scope as final so upgrading cannot silently expand a prior confirmation
+      // into the new multi-batch behavior.
+      historyComplete: saved.historyComplete === undefined
+        ? true
+        : Boolean(saved.historyComplete),
       filterReferenceTime: Number.isFinite(saved.filterReferenceTime)
         ? saved.filterReferenceTime
         : (Number.isFinite(saved.savedAt) ? saved.savedAt : 0),
@@ -428,7 +445,7 @@
           .slice(-1000)
         : [],
     };
-    if (!loaded.queueDigest && loaded.queue.length > 0) {
+    if ((configWasMigrated || !loaded.queueDigest) && loaded.queue.length > 0) {
       loaded.queueDigest = computeQueueDigest(
         loaded.queue,
         loaded.target,
@@ -731,7 +748,7 @@
       (requestMethod === 'GET' && path === '/users/@me')
       || (
         requestMethod === 'GET'
-        && /^\/channels\/\d{1,20}\/messages\?limit=100(?:&before=\d{1,20})?$/.test(path)
+        && /^\/channels\/\d{1,20}\/messages\?limit=(?:[1-9]|[1-9]\d|100)(?:&before=\d{1,20})?$/.test(path)
       )
       || (
         requestMethod === 'DELETE'
@@ -1010,6 +1027,7 @@
       maxRetries: [1, 50],
       stopAfterErrors: [1, 100],
       checkpointEvery: [1, 100],
+      scanBatchSize: [100, 10000],
       emptyPageConfirmations: [1, 5],
       maxInvalidRequestsPer10Minutes: [2, 1000],
     };
@@ -1069,11 +1087,11 @@
     return /^\d{1,20}$/.test(String(value || ''));
   }
 
-  function validateHistoryPage(messages, target, before) {
+  function validateHistoryPage(messages, target, before, requestedLimit = 100) {
     if (!Array.isArray(messages)) {
       throw new FatalApiError('Discord returned a non-array history response. The scan was paused safely.');
     }
-    if (messages.length > 100) {
+    if (messages.length > requestedLimit) {
       throw new FatalApiError('Discord returned an oversized history page. The scan was paused safely.');
     }
     let previousId = before ? BigInt(before) : null;
@@ -1147,6 +1165,20 @@
     );
   }
 
+  function processedDeletionCount() {
+    return runState.deleted + runState.alreadyGone + runState.failed;
+  }
+
+  function remainingDeletionAllowance(config) {
+    if (!config.maxMessages) return Number.POSITIVE_INFINITY;
+    return Math.max(0, config.maxMessages - processedDeletionCount());
+  }
+
+  function deletionLimitReached(config) {
+    return Number.isFinite(remainingDeletionAllowance(config))
+      && remainingDeletionAllowance(config) <= 0;
+  }
+
   function readConfigFromUi() {
     if (!shadow) return loadPrefs();
     const value = (id) => shadow.getElementById(id)?.value ?? '';
@@ -1172,6 +1204,7 @@
       maxRetries: integer(value('dpe-retries'), 12, 1, 50),
       stopAfterErrors: integer(value('dpe-error-stop'), 5, 1, 100),
       checkpointEvery: integer(value('dpe-checkpoint'), 10, 1, 100),
+      scanBatchSize: integer(value('dpe-batch-size'), 500, 100, 10000),
       emptyPageConfirmations: integer(value('dpe-empty-confirmations'), 2, 1, 5),
       maxInvalidRequestsPer10Minutes: integer(value('dpe-invalid-limit'), 20, 2, 1000),
       pauseOnNavigate: checked('dpe-pause-nav'),
@@ -1210,6 +1243,7 @@
     setValue('dpe-retries', prefs.maxRetries);
     setValue('dpe-error-stop', prefs.stopAfterErrors);
     setValue('dpe-checkpoint', prefs.checkpointEvery);
+    setValue('dpe-batch-size', prefs.scanBatchSize);
     setValue('dpe-empty-confirmations', prefs.emptyPageConfirmations);
     setValue('dpe-invalid-limit', prefs.maxInvalidRequestsPer10Minutes);
     setChecked('dpe-pause-nav', prefs.pauseOnNavigate);
@@ -1217,15 +1251,17 @@
     setChecked('dpe-risk', prefs.riskAccepted);
   }
 
-  async function startScan({ resume = false } = {}) {
+  async function startScan({ resume = false, continuation = false } = {}) {
     if (runtime.mode !== 'idle') return;
-    const target = resume ? runState.target : parseTarget();
+    const target = (resume || continuation) ? runState.target : parseTarget();
     if (!target) {
       log('error', 'Open the exact Discord channel or DM you want to clean first.');
       return;
     }
 
-    const config = resume && runState.config ? runState.config : readConfigFromUi();
+    const config = (resume || continuation) && runState.config
+      ? runState.config
+      : readConfigFromUi();
     try {
       validateConfig(config);
     } catch (error) {
@@ -1249,14 +1285,20 @@
         && runState.operation === 'scanning'
         && runState.signature === signature
         && sameTarget(runState.target, target);
+      const canContinue = continuation
+        && runState.operation === 'batching'
+        && runState.signature === signature
+        && sameTarget(runState.target, target)
+        && !runState.historyComplete
+        && runState.queue.length === 0;
 
-      if (resume && !canResume) {
+      if ((resume && !canResume) || (continuation && !canContinue)) {
         throw new FatalApiError(
-          'The signed-in account, target, or saved scan settings changed. Start a new dry run instead of resuming this checkpoint.',
+          'The signed-in account, target, saved settings, or batch checkpoint changed. Start a new dry run instead.',
         );
       }
 
-      if (!canResume) {
+      if (!canResume && !canContinue) {
         runState = {
           ...emptyRunState(),
           status: 'scanning',
@@ -1267,6 +1309,17 @@
           config,
           filterReferenceTime: runtime.startedAt,
         };
+      } else if (canContinue) {
+        runState.status = 'scanning';
+        runState.operation = 'scanning';
+        runState.batchNumber += 1;
+        runState.batchScannedMessages = 0;
+        runState.batchProcessed = 0;
+        runState.initialMatches = 0;
+        runState.matchedMessages = 0;
+        runState.firstTimestamp = '';
+        runState.lastTimestamp = '';
+        log('info', `Starting batch ${runState.batchNumber} before message ${runState.scanCursor}.`);
       } else {
         runState.status = 'scanning';
         if (!Number.isFinite(runState.filterReferenceTime) || runState.filterReferenceTime <= 0) {
@@ -1279,7 +1332,7 @@
       savePrefs(config);
       saveRunState();
       const { compiledRegex, excludedTerms } = compileFilters(config);
-      let before = canResume ? runState.scanCursor : '';
+      let before = (canResume || canContinue) ? runState.scanCursor : '';
       let reachedDateFloor = false;
       let consecutiveEmptyPages = 0;
 
@@ -1289,8 +1342,27 @@
       );
 
       while (!reachedDateFloor) {
+        // A reload can occur after the boundary page was checkpointed but before
+        // the normal post-page transition ran. Normalize that state before
+        // making another request so a completed batch never overshoots.
+        if (
+          runState.batchScannedMessages >= config.scanBatchSize
+          && runState.queue.length > 0
+        ) {
+          break;
+        }
+        if (runState.batchScannedMessages >= config.scanBatchSize) {
+          log('info', `Batch ${runState.batchNumber} had no matches; continuing to the next ${config.scanBatchSize.toLocaleString()} history messages.`);
+          runState.batchNumber += 1;
+          runState.batchScannedMessages = 0;
+        }
         await controlPoint();
-        const query = new URLSearchParams({ limit: '100' });
+        const remainingInBatch = Math.max(
+          1,
+          config.scanBatchSize - runState.batchScannedMessages,
+        );
+        const pageLimit = Math.min(100, remainingInBatch);
+        const query = new URLSearchParams({ limit: String(pageLimit) });
         if (before) query.set('before', before);
         const response = await apiRequest(
           `/channels/${target.channelId}/messages?${query.toString()}`,
@@ -1306,10 +1378,13 @@
         }
 
         const messages = await response.json();
-        const nextBefore = validateHistoryPage(messages, target, before);
+        const nextBefore = validateHistoryPage(messages, target, before, pageLimit);
         if (messages.length === 0) {
           consecutiveEmptyPages += 1;
-          if (consecutiveEmptyPages >= config.emptyPageConfirmations) break;
+          if (consecutiveEmptyPages >= config.emptyPageConfirmations) {
+            runState.historyComplete = true;
+            break;
+          }
           log(
             'warn',
             `History returned an empty page; confirming end-of-history (${consecutiveEmptyPages}/${config.emptyPageConfirmations}).`,
@@ -1320,6 +1395,7 @@
         consecutiveEmptyPages = 0;
         runState.scannedPages += 1;
         runState.scannedMessages += messages.length;
+        runState.batchScannedMessages += messages.length;
 
         for (const message of messages) {
           if (matchesMessage(
@@ -1340,12 +1416,17 @@
           }
         }
 
+        const remainingAllowance = remainingDeletionAllowance(config);
+        const batchConfig = {
+          ...config,
+          maxMessages: Number.isFinite(remainingAllowance) ? remainingAllowance : 0,
+        };
         if (
           config.deleteOrder === 'oldest'
-          && config.maxMessages > 0
-          && runState.queue.length > config.maxMessages
+          && batchConfig.maxMessages > 0
+          && runState.queue.length > batchConfig.maxMessages
         ) {
-          runState.queue = prepareQueue(runState.queue, config);
+          runState.queue = prepareQueue(runState.queue, batchConfig);
         }
 
         const oldest = messages[messages.length - 1];
@@ -1353,7 +1434,10 @@
         runState.scanCursor = before;
         if (config.afterDate) {
           const oldestTimestamp = new Date(oldest.timestamp).getTime();
-          if (oldestTimestamp < new Date(config.afterDate).getTime()) reachedDateFloor = true;
+          if (oldestTimestamp < new Date(config.afterDate).getTime()) {
+            reachedDateFloor = true;
+            runState.historyComplete = true;
+          }
         }
         if (runState.scannedPages % 5 === 0) saveRunState();
         else updateUi();
@@ -1364,27 +1448,46 @@
 
         if (reachedDateFloor) break;
         if (
-          config.deleteOrder === 'newest'
-          && config.maxMessages > 0
-          && runState.queue.length >= config.maxMessages
+          runState.batchScannedMessages >= config.scanBatchSize
+          && runState.queue.length > 0
         ) {
           break;
+        }
+        if (runState.batchScannedMessages >= config.scanBatchSize) {
+          log('info', `Batch ${runState.batchNumber} had no matches; continuing to the next ${config.scanBatchSize.toLocaleString()} history messages.`);
+          runState.batchNumber += 1;
+          runState.batchScannedMessages = 0;
         }
         await interruptibleSleep(jitter(config.scanDelayMs, config.jitterPercent));
       }
 
-      runState.queue = prepareQueue(runState.queue, config);
+      const remainingAllowance = remainingDeletionAllowance(config);
+      const batchConfig = {
+        ...config,
+        maxMessages: Number.isFinite(remainingAllowance) ? remainingAllowance : 0,
+      };
+      runState.queue = prepareQueue(runState.queue, batchConfig);
       updateQueueRange();
       runState.initialMatches = runState.queue.length;
       runState.matchedMessages = runState.queue.length;
-      runState.status = 'scanned';
-      runState.operation = '';
-      runState.confirmed = false;
+      runState.batchProcessed = 0;
+      if (runState.historyComplete && runState.queue.length === 0) {
+        runState.status = 'complete';
+        runState.operation = '';
+        runState.confirmed = false;
+      } else {
+        runState.status = 'scanned';
+        runState.operation = runState.confirmed ? 'batching' : '';
+      }
       saveRunState();
-      log(
-        'success',
-        `Dry run complete: ${runState.queue.length.toLocaleString()} of your messages are queued. Review the summary before deleting.`,
-      );
+      if (runState.queue.length > 0) {
+        log(
+          'success',
+          `Batch ${runState.batchNumber} ready: ${runState.queue.length.toLocaleString()} of your messages are queued from ${runState.batchScannedMessages.toLocaleString()} history messages.`,
+        );
+      } else {
+        log('success', 'History scan complete: no additional matching messages remain.');
+      }
     } catch (error) {
       if (error instanceof StopSignal) {
         log('info', 'Scan stopped. Its checkpoint was preserved.');
@@ -1416,6 +1519,7 @@
         `This permanently deletes ${count.toLocaleString()} messages authored by your account`,
         `from ${formatTarget(runState.target)}.`,
         `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
+        `After this preview, batches of ${runState.config.scanBatchSize.toLocaleString()} history messages will continue automatically.`,
         '',
         'Deleted messages cannot be recovered.',
         `Type exactly: ${phrase}`,
@@ -1438,6 +1542,25 @@
         config.jitterPercent,
       ),
     );
+  }
+
+  function finalizeDeletionBatch(config, { recovered = false } = {}) {
+    const workflowComplete = runState.historyComplete || deletionLimitReached(config);
+    runState.status = workflowComplete ? 'complete' : 'batch-complete';
+    runState.operation = workflowComplete ? '' : 'batching';
+    runState.confirmed = !workflowComplete;
+    saveRunState();
+    if (workflowComplete) {
+      log(
+        'success',
+        `${recovered ? 'Recovered completed batch. ' : ''}Finished: ${runState.deleted.toLocaleString()} deleted, ${runState.alreadyGone.toLocaleString()} already gone, ${runState.failed.toLocaleString()} failed.`,
+      );
+    } else {
+      log(
+        'success',
+        `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}scanning the next ${config.scanBatchSize.toLocaleString()} history messages.`,
+      );
+    }
   }
 
   async function startDelete({ resume = false, auto = false } = {}) {
@@ -1534,6 +1657,7 @@
           runState.queue.shift();
           if (response.status === 204) runState.deleted += 1;
           else runState.alreadyGone += 1;
+          runState.batchProcessed += 1;
           consecutiveErrors = 0;
           runtime.successesSinceLimit += 1;
           operationsSinceCheckpoint += 1;
@@ -1553,6 +1677,7 @@
           const payload = await responseJson(response);
           runState.queue.shift();
           runState.failed += 1;
+          runState.batchProcessed += 1;
           consecutiveErrors += 1;
           operationsSinceCheckpoint += 1;
           if (runState.failures.length < SCRIPT.maxSavedFailures) {
@@ -1589,14 +1714,7 @@
         }
       }
 
-      runState.status = 'complete';
-      runState.operation = '';
-      runState.confirmed = false;
-      saveRunState();
-      log(
-        'success',
-        `Finished: ${runState.deleted.toLocaleString()} deleted, ${runState.alreadyGone.toLocaleString()} already gone, ${runState.failed.toLocaleString()} failed.`,
-      );
+      finalizeDeletionBatch(config);
     } catch (error) {
       if (error instanceof StopSignal) {
         log('info', 'Deletion stopped. Remaining messages were preserved in the checkpoint.');
@@ -1616,6 +1734,92 @@
       abortActiveRequest();
       updateUi();
     }
+  }
+
+  async function startContinuousDeletion({
+    resume = false,
+    auto = false,
+    continueFromCheckpoint = false,
+  } = {}) {
+    if (runtime.batchLoop) return;
+    runtime.batchLoop = true;
+    updateUi();
+    try {
+      if (continueFromCheckpoint) {
+        const beforeStep = batchProgressFingerprint();
+        if (
+          runState.operation === 'deleting'
+          && runState.confirmed
+          && runState.queue.length === 0
+          && runState.config
+        ) {
+          finalizeDeletionBatch(runState.config, { recovered: true });
+        }
+        if (runState.operation === 'scanning') {
+          await startScan({ resume: true });
+        } else if (runState.operation === 'batching' && runState.queue.length === 0) {
+          await startScan({ continuation: true });
+        } else if (runState.queue.length > 0) {
+          await startDelete({ resume: true, auto });
+        }
+        if (batchProgressFingerprint() === beforeStep) {
+          log('warn', 'Continuous batching stopped because the checkpoint made no progress.');
+          return;
+        }
+      } else {
+        await startDelete({ resume, auto });
+      }
+
+      while (true) {
+        if (
+          runState.status === 'scanned'
+          && runState.operation === 'batching'
+          && runState.confirmed
+          && runState.queue.length > 0
+        ) {
+          const beforeStep = batchProgressFingerprint();
+          await startDelete({ resume: true, auto: true });
+          if (batchProgressFingerprint() === beforeStep) {
+            log('warn', 'Continuous batching stopped because deletion made no progress.');
+            break;
+          }
+          continue;
+        }
+        if (
+          runState.status === 'batch-complete'
+          && runState.operation === 'batching'
+          && runState.confirmed
+          && !runState.historyComplete
+          && !deletionLimitReached(runState.config)
+        ) {
+          const beforeStep = batchProgressFingerprint();
+          await startScan({ continuation: true });
+          if (batchProgressFingerprint() === beforeStep) {
+            log('warn', 'Continuous batching stopped because scanning made no progress.');
+            break;
+          }
+          continue;
+        }
+        break;
+      }
+    } finally {
+      runtime.batchLoop = false;
+      updateUi();
+    }
+  }
+
+  function batchProgressFingerprint() {
+    return [
+      runState.status,
+      runState.operation,
+      runState.scanCursor,
+      runState.scannedMessages,
+      runState.queue.length,
+      runState.deleted,
+      runState.alreadyGone,
+      runState.failed,
+      runState.historyComplete,
+    ].join('|');
   }
 
   function pauseActive() {
@@ -1657,6 +1861,14 @@
       return;
     }
     if (runtime.mode === 'idle') {
+      if (runtime.batchLoop) {
+        runtime.stopped = true;
+        runState.status = 'stopped';
+        runState.operation = 'batching';
+        saveRunState();
+        log('info', 'Continuous batching stopped. The checkpoint is still available.');
+        return;
+      }
       if (['scanning', 'deleting', 'paused'].includes(runState.status)) {
         runState.status = 'stopped';
         saveRunState();
@@ -1694,14 +1906,12 @@
       log('error', `Open the checkpoint target first: ${formatTarget(runState.target)}.`);
       return;
     }
-    if (runState.operation === 'scanning') {
+    if (runState.confirmed && ['scanning', 'deleting', 'batching'].includes(runState.operation)) {
+      await startContinuousDeletion({ continueFromCheckpoint: true, auto });
+    } else if (runState.operation === 'scanning') {
       await startScan({ resume: true });
-    } else if (runState.operation === 'deleting') {
-      if (!runState.confirmed) {
-        log('error', 'This deletion checkpoint was never confirmed. Run a new dry run.');
-        return;
-      }
-      await startDelete({ resume: true, auto });
+    } else if (runState.operation === 'deleting' || runState.operation === 'batching') {
+      log('error', 'This deletion checkpoint was never confirmed. Run a new dry run.');
     }
   }
 
@@ -1711,9 +1921,9 @@
     runState.failures = [];
     runState.initialMatches = runState.queue.length;
     runState.matchedMessages = runState.queue.length;
-    runState.deleted = 0;
-    runState.alreadyGone = 0;
     runState.failed = 0;
+    runState.batchProcessed = 0;
+    runState.historyComplete = true;
     updateQueueRange();
     runState.status = 'scanned';
     runState.operation = '';
@@ -1770,6 +1980,7 @@
       runState.target ? formatTarget(runState.target) : 'No dry run yet',
     );
     setText('dpe-status', runtime.paused ? 'paused' : runState.status);
+    setText('dpe-batch', runState.batchNumber.toLocaleString());
     setText('dpe-scanned', runState.scannedMessages.toLocaleString());
     setText('dpe-matched', runState.initialMatches.toLocaleString());
     setText('dpe-remaining', runState.queue.length.toLocaleString());
@@ -1784,13 +1995,13 @@
     );
 
     const total = Math.max(0, runState.initialMatches);
-    const processed = Math.max(0, runState.deleted + runState.alreadyGone + runState.failed);
+    const processed = Math.max(0, runState.batchProcessed);
     const percent = total > 0 ? clamp((processed / total) * 100, 0, 100) : 0;
     const progress = shadow.getElementById('dpe-progress-bar');
     if (progress) progress.style.width = `${percent}%`;
     setText('dpe-progress-text', total ? `${percent.toFixed(1)}%` : '0%');
 
-    const isBusy = runtime.mode !== 'idle';
+    const isBusy = runtime.mode !== 'idle' || runtime.batchLoop;
     const savedOperation = Boolean(runState.operation && runState.target);
     const sameLockedTarget = sameTarget(target, runState.target);
     const prefs = readConfigFromUi();
@@ -1839,7 +2050,7 @@
       shadow.getElementById('dpe-panel')?.classList.remove('open');
     });
     on('dpe-scan', 'click', () => startScan());
-    on('dpe-delete', 'click', () => startDelete());
+    on('dpe-delete', 'click', () => startContinuousDeletion());
     on('dpe-pause', 'click', pauseActive);
     on('dpe-resume', 'click', () => resumeCheckpoint());
     on('dpe-stop', 'click', stopActive);
@@ -1867,10 +2078,61 @@
     });
   }
 
+  function isolatePanelEvents(panel) {
+    if (!panel) return;
+    const localEventTypes = [
+      'keydown',
+      'keypress',
+      'keyup',
+      'beforeinput',
+      'input',
+      'change',
+      'paste',
+      'copy',
+      'cut',
+      'compositionstart',
+      'compositionupdate',
+      'compositionend',
+      'focusin',
+      'focusout',
+      'pointerdown',
+      'pointerup',
+      'pointercancel',
+      'mousedown',
+      'mouseup',
+      'click',
+      'dblclick',
+      'touchstart',
+      'touchend',
+      'contextmenu',
+      'dragstart',
+      'dragover',
+      'drop',
+      'wheel',
+    ];
+    for (const type of localEventTypes) {
+      panel.addEventListener(type, (event) => {
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+      });
+    }
+  }
+
+  function markShadowHostAsTextEntry(host) {
+    if (!host) return;
+    // Events crossing a shadow boundary are retargeted to the host. Marking that
+    // host as an editing surface lets page-level shortcut handlers recognize
+    // keystrokes as text entry. Contenteditable does not inherit into a shadow
+    // tree, so only the real inputs remain editable inside the panel.
+    host.contentEditable = 'true';
+    host.spellcheck = false;
+  }
+
   function mountUi() {
     if (rootHost || !document.body) return;
     rootHost = document.createElement('div');
     rootHost.id = 'dpe-root';
+    markShadowHostAsTextEntry(rootHost);
     shadow = rootHost.attachShadow({ mode: 'closed' });
     shadow.innerHTML = `
       <style>
@@ -2032,7 +2294,7 @@
                   <input id="dpe-max-messages" type="number" min="0" max="1000000" step="1">
                 </label>
                 <label class="field">
-                  <span>Delete order</span>
+                  <span>Order inside each batch</span>
                   <select id="dpe-order">
                     <option value="oldest">Oldest first</option>
                     <option value="newest">Newest first</option>
@@ -2051,6 +2313,7 @@
                 <label class="field"><span>Network / 5xx retries</span><input id="dpe-retries" type="number" min="1" max="50"></label>
                 <label class="field"><span>Pause after consecutive errors</span><input id="dpe-error-stop" type="number" min="1" max="100"></label>
                 <label class="field"><span>Checkpoint every N deletes</span><input id="dpe-checkpoint" type="number" min="1" max="100"></label>
+                <label class="field"><span>Scan, then delete every N history messages</span><input id="dpe-batch-size" type="number" min="100" max="10000" step="100"></label>
                 <label class="field"><span>Confirm empty history pages</span><input id="dpe-empty-confirmations" type="number" min="1" max="5"></label>
                 <label class="field"><span>Invalid requests / 10 min before pause</span><input id="dpe-invalid-limit" type="number" min="2" max="1000"></label>
                 <label class="check"><input id="dpe-pause-nav" type="checkbox"> Pause if I navigate away</label>
@@ -2068,7 +2331,7 @@
             <div class="metric"><b id="dpe-failed">0</b><span>Failed</span></div>
             <div class="metric"><b id="dpe-rate-limits">0</b><span>Rate limits</span></div>
           </div>
-          <div class="range">Matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
+          <div class="range">Current batch: <span id="dpe-batch">1</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
           <div class="progress"><div id="dpe-progress-bar"></div></div>
           <div class="hint">Processed: <span id="dpe-progress-text">0%</span></div>
 
@@ -2094,6 +2357,7 @@
         </main>
       </section>
     `;
+    isolatePanelEvents(shadow.getElementById('dpe-panel'));
     document.body.appendChild(rootHost);
     applyPrefsToUi(loadPrefs());
     bindUi();
@@ -2103,14 +2367,15 @@
   }
 
   function scheduleAutoResume() {
+    const resumableOperation = (
+      runState.confirmed
+      && ['scanning', 'deleting', 'batching'].includes(runState.operation)
+    );
     if (
       autoResumeTimer
       || runtime.mode !== 'idle'
       || !runState.config?.autoResume
-      || runState.status !== 'deleting'
-      || runState.operation !== 'deleting'
-      || !runState.confirmed
-      || !runState.queue.length
+      || !resumableOperation
       || !sameTarget(parseTarget(), runState.target)
     ) {
       return;
@@ -2129,7 +2394,7 @@
       clearInterval(autoResumeInterval);
       autoResumeInterval = null;
       autoResumeTimer = null;
-      resumeCheckpoint({ auto: true });
+      startContinuousDeletion({ continueFromCheckpoint: true, auto: true });
     }, 10000);
     updateUi();
   }

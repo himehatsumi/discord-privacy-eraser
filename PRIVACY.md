@@ -47,6 +47,7 @@ A checkpoint may contain:
 - The signed-in user ID.
 - Queued message IDs and timestamps.
 - Progress counters and failed message IDs.
+- The current batch number, scan cursor, batch capacity, and whether end-of-history was confirmed.
 - A non-cryptographic queue-integrity checksum.
 - Rate-limit deadlines, learned pacing, and recent invalid-request timestamps.
 

@@ -2,6 +2,20 @@
 
 All notable changes are documented here.
 
+## 1.3.0 — 2026-07-24
+
+- Changed long-history processing to scan 500 raw history messages, delete that batch's reviewed matches, and repeat.
+- Added a configurable history batch size from 100 to 10,000 while keeping 500 as the default.
+- Kept the maximum deletion count global across batches and bounded every batch queue.
+- Added a single target-bound confirmation for the first preview, with automatic continuation only while the account, target, filters, and checkpoint remain locked.
+- Added batch-aware pause, stop, reload recovery, delayed auto-resume, and progress display.
+- Added no-progress detection so account/target/preflight failures cannot create a tight automatic retry loop.
+- Sized the last API page request to the exact remaining batch capacity so custom batches never overshoot.
+- Normalized reloads at scan/delete phase boundaries and kept pre-v1.3 confirmations from expanding into the new multi-batch scope.
+- Marked the shadow host as a text-entry surface and isolated keyboard, paste, composition, form, and pointer events at the panel boundary so Discord cannot steal its input.
+- Recomputed queue checksums when migrating older checkpoints to the new batch configuration.
+- Added integration and static checks for 500-message scan/delete interleaving, input isolation, migration, and no-progress handling.
+
 ## 1.2.0 — 2026-07-24
 
 - Continued direct history scans across short non-empty pages and added configurable repeated-empty confirmation.

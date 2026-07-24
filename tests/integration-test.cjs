@@ -14,6 +14,8 @@ const exportBlock = `
     getCurrentUser: () => currentUser,
     getRunState: () => runState,
     getRuntime: () => runtime,
+    isolatePanelEvents,
+    markShadowHostAsTextEntry,
     matchesMessage,
     prepareQueue,
     recordInvalidRequest,
@@ -22,6 +24,7 @@ const exportBlock = `
     setCurrentUser: (value) => { currentUser = value; },
     setRunState: (value) => { runState = value; },
     startDelete,
+    startContinuousDeletion,
     startScan,
     validateConfig,
   };
@@ -132,6 +135,7 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     maxRetries: 2,
     stopAfterErrors: 2,
     checkpointEvery: 1,
+    scanBatchSize: 500,
     emptyPageConfirmations: 1,
     maxInvalidRequestsPer10Minutes: 20,
     pauseOnNavigate: true,
@@ -198,6 +202,41 @@ function historyBefore(url) {
   return new URL(url).searchParams.get('before');
 }
 
+function testPanelEditingEventsStayInsideUserscript() {
+  const harness = makeHarness();
+  const host = {};
+  harness.test.markShadowHostAsTextEntry(host);
+  assert.equal(host.contentEditable, 'true');
+  assert.equal(host.spellcheck, false);
+
+  const listeners = new Map();
+  const panel = {
+    addEventListener(type, listener) {
+      listeners.set(type, listener);
+    },
+  };
+  harness.test.isolatePanelEvents(panel);
+
+  for (const type of ['keydown', 'beforeinput', 'input', 'paste', 'compositionupdate']) {
+    let stopped = false;
+    let stoppedImmediately = false;
+    listeners.get(type)({
+      stopPropagation() {
+        stopped = true;
+      },
+      stopImmediatePropagation() {
+        stoppedImmediately = true;
+      },
+    });
+    assert.equal(stopped, true, `${type} should not bubble into Discord's global handlers`);
+    assert.equal(
+      stoppedImmediately,
+      true,
+      `${type} should not reach later Discord listeners on the event path`,
+    );
+  }
+}
+
 async function testCredentialSnifferIgnoresThirdParties() {
   const harness = makeHarness();
   harness.setFetchHandler(async () => response({ ok: true }));
@@ -218,6 +257,10 @@ async function testCredentialSnifferIgnoresThirdParties() {
 async function testApiAllowlistBindsMethodPathAndBody() {
   const harness = makeHarness();
   harness.test.acceptToken(TOKEN_A);
+  harness.setFetchHandler(async ({ method }) => {
+    if (method === 'GET') return response([]);
+    throw new Error(`Unexpected ${method}`);
+  });
 
   await assert.rejects(
     () => harness.test.apiRequest('/users/@me', { method: 'DELETE' }),
@@ -230,7 +273,20 @@ async function testApiAllowlistBindsMethodPathAndBody() {
     ),
     /Blocked an unexpected Discord API method, path, or body/,
   );
-  assert.equal(harness.calls.length, 0, 'blocked requests must fail before network access');
+  await harness.test.apiRequest(
+    `/channels/${TARGET_CHANNEL}/messages?limit=50&before=123`,
+  );
+  await assert.rejects(
+    () => harness.test.apiRequest(
+      `/channels/${TARGET_CHANNEL}/messages?limit=101&before=123`,
+    ),
+    /Blocked an unexpected Discord API method, path, or body/,
+  );
+  assert.equal(
+    harness.calls.length,
+    1,
+    'only a canonical history request with a limit from 1 through 100 may reach the network',
+  );
 }
 
 async function testCappedScanAndDelete() {
@@ -456,6 +512,202 @@ async function testOldestCapBoundsWorkingQueue() {
   assert.deepEqual(Array.from(state.queue, (item) => item.id), ['101', '102']);
 }
 
+async function testContinuousFiveHundredMessageBatches() {
+  const harness = makeHarness({ scanBatchSize: 500 });
+  const ownIds = new Set(['700', '600', '500', '400', '300', '200']);
+  const page = (high) => Array.from({ length: 100 }, (_, index) => {
+    const id = String(high - index);
+    return message({
+      id,
+      author: ownIds.has(id) ? USER_A : USER_B,
+      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+    });
+  });
+  const pages = new Map([
+    ['', page(700)],
+    ['601', page(600)],
+    ['501', page(500)],
+    ['401', page(400)],
+    ['301', page(300)],
+    ['201', page(200)],
+    ['101', []],
+  ]);
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      const before = historyBefore(url) || '';
+      if (!pages.has(before)) throw new Error(`Unexpected batch cursor ${before}`);
+      return response(pages.get(before));
+    }
+    if (method === 'DELETE') {
+      const id = url.split('/').at(-1);
+      if (!ownIds.has(id)) throw new Error(`Attempted to delete non-owned message ${id}`);
+      return response(null, 204);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  let state = harness.test.getRunState();
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.scannedMessages, 500);
+  assert.equal(state.historyComplete, false);
+  assert.deepEqual(
+    Array.from(state.queue, (item) => item.id),
+    ['300', '400', '500', '600', '700'],
+  );
+
+  await harness.test.startContinuousDeletion();
+  state = harness.test.getRunState();
+  assert.equal(state.status, 'complete');
+  assert.equal(state.historyComplete, true);
+  assert.equal(state.scannedMessages, 600);
+  assert.equal(state.deleted, 6);
+
+  const firstDeleteIndex = harness.calls.findIndex((call) => call.method === 'DELETE');
+  const sixthHistoryIndex = harness.calls.findIndex(
+    (call) => call.method === 'GET' && historyBefore(call.url) === '201',
+  );
+  assert.ok(firstDeleteIndex > 0 && firstDeleteIndex < sixthHistoryIndex);
+}
+
+async function testCustomBatchNeverOvershoots() {
+  const harness = makeHarness({ scanBatchSize: 150 });
+  const requestedLimits = [];
+  const page = (high, count) => Array.from({ length: count }, (_, index) => message({
+    id: String(high - index),
+    author: index === 0 ? USER_A : USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      requestedLimits.push(Number(new URL(url).searchParams.get('limit')));
+      return response(historyBefore(url) ? page(50, 50) : page(150, 100));
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.deepEqual(requestedLimits, [100, 50]);
+  assert.equal(state.scannedMessages, 150);
+  assert.equal(state.batchScannedMessages, 150);
+  assert.equal(state.status, 'scanned');
+}
+
+async function testContinuousBatchingStopsOnUnchangedPreflightFailure() {
+  const harness = makeHarness({ scanBatchSize: 500 });
+  let identityRequests = 0;
+  const page = (high) => Array.from({ length: 100 }, (_, index) => message({
+    id: String(high - index),
+    author: high === 500 && index === 0 ? USER_A : USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+  }));
+  const pages = new Map([
+    ['', page(500)],
+    ['401', page(400)],
+    ['301', page(300)],
+    ['201', page(200)],
+    ['101', page(100)],
+  ]);
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) {
+      identityRequests += 1;
+      return response(identityRequests <= 2 ? USER_A : USER_B);
+    }
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      const before = historyBefore(url) || '';
+      return response(pages.get(before));
+    }
+    if (method === 'DELETE' && url.endsWith('/messages/500')) return response(null, 204);
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  await harness.test.startContinuousDeletion();
+  const state = harness.test.getRunState();
+
+  assert.equal(identityRequests, 3, 'an unchanged failed preflight must not spin');
+  assert.equal(state.status, 'batch-complete');
+  assert.equal(state.operation, 'batching');
+  assert.equal(state.deleted, 1);
+}
+
+async function testCompletedBoundaryCheckpointDoesNotOverscan() {
+  const harness = makeHarness({ scanBatchSize: 100 });
+  let historyRequests = 0;
+  const firstPage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(100 - index),
+    author: index === 0 ? USER_A : USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 100 - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      historyRequests += 1;
+      if (historyRequests === 1) return response(firstPage);
+      throw new Error('A resumed completed batch must not fetch another history message.');
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const interrupted = harness.test.getRunState();
+  harness.test.setRunState({
+    ...interrupted,
+    status: 'stopped',
+    operation: 'scanning',
+  });
+
+  await harness.test.startScan({ resume: true });
+  const state = harness.test.getRunState();
+  assert.equal(historyRequests, 1);
+  assert.equal(state.status, 'scanned');
+  assert.deepEqual(Array.from(state.queue, (item) => item.id), ['100']);
+}
+
+async function testEmptyDeletionCheckpointAdvancesSafely() {
+  const harness = makeHarness({ scanBatchSize: 100 });
+  const firstPage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(100 - index),
+    author: index === 0 ? USER_A : USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 100 - index)).toISOString(),
+  }));
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response(historyBefore(url) ? [] : firstPage);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const interrupted = harness.test.getRunState();
+  harness.test.setRunState({
+    ...interrupted,
+    status: 'deleting',
+    operation: 'deleting',
+    confirmed: true,
+    queue: [],
+    queueDigest: '',
+    deleted: 1,
+    batchProcessed: 1,
+  });
+
+  await harness.test.startContinuousDeletion({ continueFromCheckpoint: true });
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'complete');
+  assert.equal(state.historyComplete, true);
+  assert.equal(state.deleted, 1);
+  assert.equal(state.scannedMessages, 100);
+}
+
 async function testCompactCheckpointRestoresLockedChannel() {
   const first = makeHarness();
   first.setFetchHandler(async ({ url, method }) => {
@@ -476,12 +728,14 @@ async function testCompactCheckpointRestoresLockedChannel() {
   assert.equal(serialized.queue[0].length, 2);
   delete serialized.config.emptyPageConfirmations;
   delete serialized.config.maxInvalidRequestsPer10Minutes;
+  delete serialized.config.scanBatchSize;
+  delete serialized.historyComplete;
   serialized.signature = first.test.configSignature(
     serialized.config,
     serialized.target,
     serialized.userId,
   );
-  delete serialized.queueDigest;
+  serialized.queueDigest = 'stale-checksum-from-an-older-config-signature';
   first.stored.set('dpe:run:v1', JSON.stringify(serialized));
 
   const reloaded = makeHarness({}, first.stored);
@@ -492,7 +746,17 @@ async function testCompactCheckpointRestoresLockedChannel() {
   assert.equal(restored.queue[0].channelId, TARGET_CHANNEL);
   assert.equal(restored.config.emptyPageConfirmations, 2);
   assert.equal(restored.config.maxInvalidRequestsPer10Minutes, 20);
-  assert.ok(restored.queueDigest, 'older checkpoints should receive a queue checksum on load');
+  assert.equal(restored.config.scanBatchSize, 500);
+  assert.equal(
+    restored.historyComplete,
+    true,
+    'upgrading a pre-batch checkpoint must not expand its previously confirmed scope',
+  );
+  assert.notEqual(
+    restored.queueDigest,
+    'stale-checksum-from-an-older-config-signature',
+    'migrated checkpoints must receive a checksum bound to the migrated signature',
+  );
   assert.equal(
     restored.signature,
     reloaded.test.configSignature(restored.config, restored.target, restored.userId),
@@ -918,6 +1182,7 @@ async function testInvalidRequestCircuitBreakerSurvivesMixedSuccess() {
 }
 
 async function main() {
+  testPanelEditingEventsStayInsideUserscript();
   await testCredentialSnifferIgnoresThirdParties();
   await testApiAllowlistBindsMethodPathAndBody();
   await testCappedScanAndDelete();
@@ -926,6 +1191,11 @@ async function main() {
   await testNewScanIgnoresStaleCheckpointTarget();
   await testFailedScanPreflightPreservesExistingCheckpoint();
   await testOldestCapBoundsWorkingQueue();
+  await testContinuousFiveHundredMessageBatches();
+  await testCustomBatchNeverOvershoots();
+  await testContinuousBatchingStopsOnUnchangedPreflightFailure();
+  await testCompletedBoundaryCheckpointDoesNotOverscan();
+  await testEmptyDeletionCheckpointAdvancesSafely();
   await testCompactCheckpointRestoresLockedChannel();
   await testPersistedCooldownSurvivesReload();
   testFilterMatrix();

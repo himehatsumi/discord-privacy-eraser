@@ -24,11 +24,14 @@ If the session indicator does not turn green, change to another Discord channel 
 1. Accept the warning.
 2. Keep **Include pinned messages** off.
 3. Optionally add dates, protected phrases, or a small maximum such as `10`.
-4. Click **Dry run / scan**. This does not delete anything.
-5. Review the target lock, matched count, and date range.
-6. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID.
+4. Leave **Scan, then delete every N history messages** at `500`, or choose a batch size from `100` to `10,000`.
+5. Click **Dry run / scan**. It previews the first batch and does not delete anything.
+6. Review the target lock, matched count, and date range.
+7. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID.
 
-For a very long history, leave the tab open. Pausing or stopping preserves a checkpoint. HTTP 429 responses respect Discord's `Retry-After`; transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
+After that one confirmation, the script deletes the reviewed matches, scans the next 500 history messages, deletes that batch's matches, and repeats until it reaches the configured maximum, date boundary, or end of history. A batch with no matches is skipped without pausing. The maximum deletion setting applies to the entire run, not separately to every batch.
+
+For a very long history, leave the tab open. Pausing or stopping preserves the exact scan/delete batch checkpoint. HTTP 429 responses respect Discord's `Retry-After`; transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
 
 ## Safety properties
 
@@ -39,6 +42,7 @@ For a very long history, leave the tab open. Pausing or stopping preserves a che
 - The saved queue has a target/account/settings-bound checksum to detect accidental checkpoint corruption.
 - The signed-in identity is rechecked before deletion; an account change stops the run before another message is touched.
 - Dry run and a target-bound typed confirmation are mandatory before a new deletion.
+- Only the first batch can request confirmation; later batches continue under the same account, target, filter, and queue-integrity lock.
 - Pinned messages are protected by default.
 - Navigation away pauses the run by default.
 - No remote dependencies, update URL, telemetry, attachment downloads, or third-party requests.
@@ -54,21 +58,23 @@ For a very long history, leave the tab open. Pausing or stopping preserves a che
 - **Always preserve:** A newline-separated list. Any matching message is skipped.
 - **Attachments / links:** Limit deletion to specific message categories.
 - **Protect newer than:** Skips recent messages by age in hours.
-- **Maximum deletions:** Caps the dry-run queue; `0` is unlimited.
-- **Oldest/newest first:** Controls both deletion order and which messages a maximum cap selects.
+- **Maximum deletions:** Caps the complete multi-batch run; `0` is unlimited.
+- **Oldest/newest first:** Controls order and maximum-cap selection inside each scanned batch. Batches themselves always move from newer history toward older history.
+- **Scan, then delete every N:** Controls the raw history-message batch size; the default is exactly `500`.
 - **Confirm empty history pages:** Requires repeated empty responses before declaring the scan complete.
 - **Invalid requests / 10 min:** Pauses after the configured number of counted 401/403/429 responses; shared-resource 429 responses are excluded.
 
-Age filters use one fixed timestamp for the entire dry run, including after pause/reload. Capped oldest-first scans retain only the bounded working set instead of keeping every match in memory.
+Age filters use one fixed timestamp for the entire run, including after pause/reload. Each batch retains only its bounded working set instead of keeping every match from a long conversation in memory.
 
 ## Recovery behavior
 
 - **Pause:** Stops before the next request.
 - **Stop:** Ends the active run but retains the checkpoint.
-- **Resume:** Continues an interrupted scan or confirmed deletion.
+- **Resume:** Continues the interrupted scan or deletion and then returns to the automatic scan/delete batch loop.
 - **Retry failures:** Moves HTTP 400/403 failures back into a new review queue.
-- **Auto-resume:** Off by default. If enabled, an interrupted confirmed deletion resumes after a 10-second grace period; **Stop** cancels it.
+- **Auto-resume:** Off by default. If enabled, any interrupted confirmed batch workflow resumes after a 10-second grace period; **Stop** cancels it.
 - Discord DOM replacement is detected and the launcher is remounted without starting a second operation or auto-resume timer.
+- The shadow host is identified as a text-entry surface, and keyboard, paste, composition, pointer, and form-input events stop at the panel boundary so Discord's global handlers do not steal editing from its fields.
 
 Deleting the other person's messages is not possible in a DM. System-generated call/activity entries may also be non-deletable and will appear as failures.
 
@@ -88,7 +94,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
-- Mocked end-to-end scans and deletions covering filters, short/empty/out-of-order pages, bounded queues, migrated checkpoints, account changes, preflight failure, persisted cooldowns, mixed invalid responses, HTTP 401, and HTTP 429 recovery.
+- Mocked end-to-end scans and deletions covering exact 500-message interleaving, no-progress loop guards, panel input isolation, filters, short/empty/out-of-order pages, bounded queues, migrated checkpoints, account changes, preflight failure, persisted cooldowns, mixed invalid responses, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 
 GitHub Actions runs the same checks on every push and pull request.
