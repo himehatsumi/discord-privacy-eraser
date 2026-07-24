@@ -22,6 +22,7 @@ Changes should be rejected if they introduce any of the following without an exp
 - `@require`, `@connect`, remote executable code, `eval`, or `new Function`.
 - Requests to a host other than the active Discord origin.
 - A latest-message search whose author ID, channel ID, guild/DM scope, sort order, or offset differs from the locked run.
+- A sparse-window search whose `max_id` is absent from the exact request lock, malformed, or does not strictly bound every accepted hit to older history.
 - Trusting a search hit without rechecking its author ID, channel ID, snowflake ID, and timestamp, or failing to fall back safely when search is unavailable or malformed.
 - Token display, copy, export, logging, or persistent storage.
 - Message-content or attachment persistence.
@@ -31,6 +32,8 @@ Changes should be rejected if they introduce any of the following without an exp
 - Continuing an automatically confirmed batch after its account, target, filter signature, or queue-integrity lock changes.
 - Counting or queueing any message newer than the authenticated account's discovered latest-message anchor in a fresh run.
 - Counting a message toward the owned-message batch boundary unless its author ID equals the locked `/users/@me` identity.
+- Counting or queueing Discord `CALL`, any type outside the reviewed normal user-content allowlist, or an unknown future message type.
+- Resuming a checkpoint created before the current message-type eligibility version.
 - Persisting matched-message log content in preferences, checkpoints, page storage, files, the clipboard, or network requests.
 - Including message content, usernames, raw Discord IDs, credentials, or tokens in the diagnostic log, or copying diagnostics without an explicit user action.
 - Removal of queue-integrity, strict history-ordering, or invalid-request circuit checks.

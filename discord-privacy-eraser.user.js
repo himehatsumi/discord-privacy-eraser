@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.5.1
+// @version      1.6.0
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -36,7 +36,7 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.5.1',
+    version: '1.6.0',
     prefsKey: 'dpe:prefs:v4',
     legacyPrefsKeys: ['dpe:prefs:v1', 'dpe:prefs:v2', 'dpe:prefs:v3'],
     runKey: 'dpe:run:v1',
@@ -46,6 +46,13 @@
     maxSavedFailures: 2000,
     invalidRequestWindowMs: 10 * 60 * 1000,
   });
+
+  // Discord documents DEFAULT, REPLY, CHAT_INPUT_COMMAND, and
+  // CONTEXT_MENU_COMMAND as normal user-content message types. Limit this
+  // author-only tool to those types so calls and other authored system events
+  // cannot anchor a batch or enter a deletion queue. Unknown future types fail
+  // closed until they are reviewed explicitly.
+  const OWNED_CONTENT_MESSAGE_TYPES = new Set([0, 19, 20, 23]);
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const nativeFetch = typeof pageWindow.fetch === 'function'
@@ -371,6 +378,7 @@
   function emptyRunState() {
     return {
       version: 1,
+      eligibilityVersion: 2,
       status: 'idle',
       operation: '',
       savedAt: 0,
@@ -386,10 +394,12 @@
       anchorFound: false,
       anchorMethod: '',
       skippedNewerMessages: 0,
+      sparseSearchJumps: 0,
       batchMode: 'owned',
       batchNumber: 1,
       batchScannedMessages: 0,
       batchOwnedMessages: 0,
+      batchIgnoredOwnedSystemMessages: 0,
       batchFilterMatches: 0,
       batchProcessed: 0,
       scannedPages: 0,
@@ -412,7 +422,15 @@
 
   function loadRunState() {
     const saved = storageGet(SCRIPT.runKey, null);
-    if (!saved || saved.version !== 1 || !Array.isArray(saved.queue)) return emptyRunState();
+    if (
+      !saved
+      || saved.version !== 1
+      || saved.eligibilityVersion !== 2
+      || saved.batchMode !== 'owned'
+      || !Array.isArray(saved.queue)
+    ) {
+      return emptyRunState();
+    }
     const targetChannelId = String(saved.target?.channelId || '');
     let config = saved.config;
     let signature = saved.signature;
@@ -446,10 +464,7 @@
       ...saved,
       config,
       signature,
-      // Checkpoints created before 1.5 keep their reviewed raw-history batch
-      // boundary. A new dry run is required before changing to owned-message
-      // batches so an update never silently expands a confirmed scope.
-      batchMode: saved.batchMode === 'owned' ? 'owned' : 'history',
+      batchMode: 'owned',
       anchorFound: saved.anchorFound === undefined
         ? true
         : Boolean(saved.anchorFound),
@@ -619,6 +634,7 @@
       userId: String(userId || ''),
       signature: String(signature || ''),
       batchMode: String(batchMode || 'history'),
+      eligibilityVersion: 2,
       items: queue.map((item) => [
         String(item?.id || ''),
         String(item?.timestamp || ''),
@@ -694,9 +710,12 @@
   function authorPageDiagnostics(messages, userId) {
     const authors = new Map();
     const types = new Map();
+    const selfTypes = new Map();
     let missingAuthor = 0;
     let webhookMessages = 0;
-    let owned = 0;
+    let authoredBySelf = 0;
+    let eligibleOwned = 0;
+    let ignoredOwnedSystem = 0;
 
     for (const message of messages) {
       const type = String(message?.type ?? 'missing');
@@ -709,11 +728,19 @@
       }
       const label = authorId === String(userId || '') ? 'self' : debugId(authorId);
       authors.set(label, (authors.get(label) || 0) + 1);
-      if (label === 'self') owned += 1;
+      if (label === 'self') {
+        authoredBySelf += 1;
+        selfTypes.set(type, (selfTypes.get(type) || 0) + 1);
+        if (isDeletableOwnedMessage(message, userId)) eligibleOwned += 1;
+        else ignoredOwnedSystem += 1;
+      }
     }
 
     return {
-      owned,
+      owned: eligibleOwned,
+      authoredBySelf,
+      eligibleOwned,
+      ignoredOwnedSystem,
       missingAuthor,
       webhookMessages,
       authors: [...authors.entries()]
@@ -721,6 +748,9 @@
         .slice(0, 12)
         .map(([author, count]) => ({ author, count })),
       messageTypes: [...types.entries()]
+        .sort((left, right) => right[1] - left[1])
+        .map(([type, count]) => ({ type, count })),
+      selfMessageTypes: [...selfTypes.entries()]
         .sort((left, right) => right[1] - left[1])
         .map(([type, count]) => ({ type, count })),
     };
@@ -918,21 +948,38 @@
     if (remaining === 0) saveRunState();
   }
 
+  function authorSearchPath(target, userId, maxId = '') {
+    const query = new URLSearchParams({
+      author_id: String(userId),
+      ...(target.guildId === '@me' ? {} : { channel_id: String(target.channelId) }),
+      sort_by: 'timestamp',
+      sort_order: 'desc',
+      ...(maxId ? { max_id: String(maxId) } : {}),
+      offset: '0',
+      limit: '25',
+    });
+    return target.guildId === '@me'
+      ? `/channels/${target.channelId}/messages/search?${query.toString()}`
+      : `/guilds/${target.guildId}/messages/search?${query.toString()}`;
+  }
+
   function isAllowedAuthorSearchPath(path) {
     const target = runtime.activeTarget || runState.target;
     const userId = String(currentUser?.id || runState.userId || '');
     if (!target || !isSnowflake(target.channelId) || !isSnowflake(userId)) return false;
-    const query = new URLSearchParams({
-      author_id: userId,
-      ...(target.guildId === '@me' ? {} : { channel_id: String(target.channelId) }),
-      sort_by: 'timestamp',
-      sort_order: 'desc',
-      offset: '0',
-    });
-    const expected = target.guildId === '@me'
-      ? `/channels/${target.channelId}/messages/search?${query.toString()}`
-      : `/guilds/${target.guildId}/messages/search?${query.toString()}`;
-    return path === expected;
+    try {
+      if (!String(path).startsWith('/')) return false;
+      const parsed = new URL(path, location.origin);
+      if (parsed.origin !== location.origin || parsed.hash) return false;
+      const maxIds = parsed.searchParams.getAll('max_id');
+      if (maxIds.length > 1) return false;
+      const maxId = maxIds[0] || '';
+      if (maxId && !isSnowflake(maxId)) return false;
+      return `${parsed.pathname}?${parsed.searchParams.toString()}`
+        === authorSearchPath(target, userId, maxId);
+    } catch {
+      return false;
+    }
   }
 
   async function apiRequest(path, options = {}) {
@@ -1169,6 +1216,18 @@
     );
   }
 
+  function messageType(message) {
+    const value = message?.type;
+    if (value === undefined || value === null) return 0;
+    const parsed = Number(value);
+    return Number.isInteger(parsed) ? parsed : Number.NaN;
+  }
+
+  function isDeletableOwnedMessage(message, userId) {
+    return isAuthoredByUser(message, userId)
+      && OWNED_CONTENT_MESSAGE_TYPES.has(messageType(message));
+  }
+
   function matchesMessage(
     message,
     config,
@@ -1176,7 +1235,7 @@
     excludedTerms,
     referenceTime = Date.now(),
   ) {
-    if (!isAuthoredByUser(message, currentUser?.id)) return false;
+    if (!isDeletableOwnedMessage(message, currentUser?.id)) return false;
     if (!config.includePinned && message.pinned) return false;
     if (!config.includeEdited && message.edited_timestamp) return false;
 
@@ -1425,7 +1484,7 @@
     let ownedNeeded = Math.max(0, config.scanBatchSize - runState.batchOwnedMessages);
     if (ownedNeeded === 0) return [];
     for (let index = 0; index < messages.length; index += 1) {
-      if (!isAuthoredByUser(messages[index], runState.userId)) continue;
+      if (!isDeletableOwnedMessage(messages[index], runState.userId)) continue;
       ownedNeeded -= 1;
       if (ownedNeeded === 0) return messages.slice(0, index + 1);
     }
@@ -1435,8 +1494,11 @@
   function recordBatchMessage(message, target, config, compiledRegex, excludedTerms) {
     runState.scannedMessages += 1;
     runState.batchScannedMessages += 1;
-    if (isAuthoredByUser(message, runState.userId)) {
+    if (isDeletableOwnedMessage(message, runState.userId)) {
       runState.batchOwnedMessages += 1;
+    } else if (isAuthoredByUser(message, runState.userId)) {
+      runState.batchIgnoredOwnedSystemMessages += 1;
+      return;
     }
     if (!matchesMessage(
       message,
@@ -1459,7 +1521,7 @@
     logMatchedMessage(message, config);
   }
 
-  function extractSearchAnchor(payload, target, userId) {
+  function extractSearchAnchor(payload, target, userId, maxId = '') {
     if (!payload || !Array.isArray(payload.messages)) return null;
     const hits = payload.messages
       .flatMap((group) => (Array.isArray(group) ? group : []))
@@ -1470,24 +1532,26 @@
       || String(message?.channel_id || '') !== String(target.channelId)
       || !isAuthoredByUser(message, userId)
       || !Number.isFinite(new Date(message?.timestamp).getTime())
+      || (maxId && BigInt(message.id) >= BigInt(maxId))
     ))) {
       return null;
     }
-    hits.sort((left, right) => snowflakeCompare(right, left));
-    return hits[0];
+    const deletableHits = hits.filter((message) => isDeletableOwnedMessage(message, userId));
+    deletableHits.sort((left, right) => snowflakeCompare(right, left));
+    return deletableHits[0] || null;
   }
 
-  async function discoverLatestOwnedMessage(target, userId, config) {
-    const query = new URLSearchParams({
-      author_id: String(userId),
-      ...(target.guildId === '@me' ? {} : { channel_id: String(target.channelId) }),
-      sort_by: 'timestamp',
-      sort_order: 'desc',
-      offset: '0',
-    });
-    const scope = target.guildId === '@me'
-      ? `/channels/${target.channelId}/messages/search`
-      : `/guilds/${target.guildId}/messages/search`;
+  async function discoverLatestOwnedMessage(
+    target,
+    userId,
+    config,
+    {
+      maxId = '',
+      purpose = 'latest-message author lookup',
+      lookupLabel = 'Fast author lookup',
+    } = {},
+  ) {
+    const path = authorSearchPath(target, userId, maxId);
     const attempts = Math.max(1, Math.min(config.maxRetries, 3));
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       await controlPoint();
@@ -1499,11 +1563,14 @@
         authenticatedUser: debugId(userId),
         apiVersion,
         sort: 'timestamp:desc',
+        maxId: debugId(maxId),
         offset: 0,
+        limit: 25,
+        purpose,
       });
       const response = await apiRequest(
-        `${scope}?${query.toString()}`,
-        { purpose: 'latest-message author lookup' },
+        path,
+        { purpose },
       );
       const payload = await responseJson(response);
       const groups = Array.isArray(payload?.messages) ? payload.messages : [];
@@ -1511,7 +1578,7 @@
       const hits = flattened.filter((message) => message?.hit === true);
       const hitDiagnostics = authorPageDiagnostics(hits, userId);
       const anchor = response.ok && response.status !== 202
-        ? extractSearchAnchor(payload, target, userId)
+        ? extractSearchAnchor(payload, target, userId, maxId)
         : null;
       debugLog('search-response', {
         attempt,
@@ -1529,6 +1596,7 @@
         flattenedCount: flattened.length,
         hitCount: hits.length,
         ownedHitCount: hitDiagnostics.owned,
+        ignoredOwnedSystemHits: hitDiagnostics.ignoredOwnedSystem,
         hitAuthors: hitDiagnostics.authors,
         selectedAnchor: debugId(anchor?.id),
         selectedTimestamp: String(anchor?.timestamp || ''),
@@ -1536,6 +1604,9 @@
           ? String(anchor.channel_id || '') === String(target.channelId)
           : null,
         selectedAuthorMatches: anchor ? isAuthoredByUser(anchor, userId) : null,
+        selectedType: anchor ? messageType(anchor) : null,
+        maxId: debugId(maxId),
+        purpose,
         ...authorPageDiagnostics(flattened, userId),
       });
       if (response.status === 202) {
@@ -1546,7 +1617,7 @@
         );
         log(
           'rate',
-          `Discord is indexing this conversation for the fast author lookup; retrying in ${formatDuration(waitMs)} (${attempt}/${attempts}).`,
+          `Discord is indexing this conversation for the ${lookupLabel.toLowerCase()}; retrying in ${formatDuration(waitMs)} (${attempt}/${attempts}).`,
         );
         await interruptibleSleep(waitMs);
         continue;
@@ -1554,20 +1625,20 @@
       if (!response.ok) {
         log(
           'warn',
-          `Fast author lookup returned HTTP ${response.status}; switching to the direct-history fallback.`,
+          `${lookupLabel} returned HTTP ${response.status}; continuing through direct history.`,
         );
         return null;
       }
       if (anchor) return anchor;
       log(
         'warn',
-        'Fast author lookup returned no strictly valid owned-message hit; switching to the direct-history fallback.',
+        `${lookupLabel} returned no strictly valid deletable owned-message hit; continuing through direct history.`,
       );
       return null;
     }
     log(
       'warn',
-      'Fast author lookup did not finish indexing in time; switching to the direct-history fallback.',
+      `${lookupLabel} did not finish indexing in time; continuing through direct history.`,
     );
     return null;
   }
@@ -1782,6 +1853,7 @@
         runState.batchNumber += 1;
         runState.batchScannedMessages = 0;
         runState.batchOwnedMessages = 0;
+        runState.batchIgnoredOwnedSystemMessages = 0;
         runState.batchFilterMatches = 0;
         runState.batchProcessed = 0;
         runState.initialMatches = 0;
@@ -1815,21 +1887,21 @@
       log(
         'info',
         isDeleteEverythingConfig(config)
-          ? 'Default delete-everything scope is active: every message authored by your authenticated account is eligible, including pinned and edited messages.'
+          ? 'Default delete-everything scope is active: every normal user-content message authored by your authenticated account is eligible, including pinned and edited messages; call/system entries are ignored.'
           : 'Custom filters are active. Ownership and filter-pass counts will be reported separately.',
       );
       if (!runState.anchorFound) {
         log(
           'info',
           config.anchorLookupMode === 'search'
-            ? 'Finding your actual latest message with Discord’s same-origin author search. The result must match the locked account and channel; otherwise the scanner automatically falls back to direct history.'
-            : 'Fast-seeking your actual latest message through direct history before starting batch 1. No fixed scan delay is added during this seek; Discord rate-limit headers and 429 waits are still enforced.',
+            ? 'Finding your actual latest deletable message with Discord’s same-origin author search. Undeletable call/system entries are rejected as anchors; invalid search results fall back to direct history.'
+            : 'Fast-seeking your actual latest deletable message through direct history before starting batch 1. No fixed scan delay is added during this seek; Discord rate-limit headers and 429 waits are still enforced.',
         );
       }
       log(
         'info',
         runState.batchMode === 'owned'
-          ? `Each batch now collects ${config.scanBatchSize.toLocaleString()} messages authored by your account, not ${config.scanBatchSize.toLocaleString()} combined messages from both people.`
+          ? `Each batch collects ${config.scanBatchSize.toLocaleString()} deletable messages authored by your account. Undeletable call/system entries are ignored, and empty 100-message windows use a locked author-search jump.`
           : 'This older checkpoint retains its previously reviewed combined-history batch boundary. Clear it and start a new dry run to use owned-message batches.',
       );
       if (!runState.anchorFound && config.anchorLookupMode === 'search') {
@@ -1850,7 +1922,7 @@
           });
           log(
             'success',
-            `Found your actual latest message at ${formatDate(searchAnchor.timestamp)} with the fast author-locked lookup. Batch 1 starts at that message; newer messages from the other participant were never walked page by page.`,
+            `Found your actual latest deletable message at ${formatDate(searchAnchor.timestamp)} with the fast author-locked lookup. Call/system entries were ignored as anchors, and newer messages from the other participant were never walked page by page.`,
           );
           if (
             config.afterDate
@@ -1878,11 +1950,12 @@
         if (batchCapacityReached(config)) {
           log(
             'info',
-            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} processed messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
+            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} deletable messages were yours, ${runState.batchIgnoredOwnedSystemMessages.toLocaleString()} authored call/system entries were ignored, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
           );
           runState.batchNumber += 1;
           runState.batchScannedMessages = 0;
           runState.batchOwnedMessages = 0;
+          runState.batchIgnoredOwnedSystemMessages = 0;
           runState.batchFilterMatches = 0;
         }
         await controlPoint();
@@ -1936,7 +2009,7 @@
         let skippedOnPage = 0;
         if (!runState.anchorFound) {
           const anchorIndex = messages.findIndex(
-            (message) => isAuthoredByUser(message, runState.userId),
+            (message) => isDeletableOwnedMessage(message, runState.userId),
           );
           if (anchorIndex === -1) {
             runState.skippedNewerMessages += messages.length;
@@ -1952,11 +2025,17 @@
             const anchorMessage = messages[anchorIndex];
             log(
               'success',
-              `Found your latest message at ${formatDate(anchorMessage.timestamp)} after fast-skipping ${runState.skippedNewerMessages.toLocaleString()} newer combined messages. Batch 1 starts here.`,
+              `Found your latest deletable message at ${formatDate(anchorMessage.timestamp)} after fast-skipping ${runState.skippedNewerMessages.toLocaleString()} newer combined items. Batch 1 starts here.`,
             );
           }
         }
         batchMessages = trimToOwnedBatchBoundary(batchMessages, config);
+        const deletableOwnedOnPage = batchMessages.reduce(
+          (count, message) => count + (
+            isDeletableOwnedMessage(message, runState.userId) ? 1 : 0
+          ),
+          0,
+        );
         runState.scannedMessages += skippedOnPage;
 
         for (const message of batchMessages) {
@@ -1977,10 +2056,57 @@
         }
 
         const oldest = batchMessages[batchMessages.length - 1] || messages[messages.length - 1];
+        let oldestForDateBoundary = oldest;
         const stoppedAtOwnedBoundary = batchMessages.length > 0
           && batchMessages.length < messages.length - skippedOnPage;
         before = stoppedAtOwnedBoundary ? String(oldest.id) : nextBefore;
         runState.scanCursor = before;
+        if (
+          runState.anchorFound
+          && runState.batchMode === 'owned'
+          && config.anchorLookupMode === 'search'
+          && deletableOwnedOnPage === 0
+          && messages.length === pageLimit
+          && !stoppedAtOwnedBoundary
+          && before
+        ) {
+          const directHistoryCursor = before;
+          const jumpAnchor = await discoverLatestOwnedMessage(
+            target,
+            runState.userId,
+            config,
+            {
+              maxId: directHistoryCursor,
+              purpose: 'sparse-window next-message lookup',
+              lookupLabel: 'Sparse-window author lookup',
+            },
+          );
+          if (jumpAnchor) {
+            before = String(jumpAnchor.id);
+            runState.scanCursor = before;
+            runState.sparseSearchJumps += 1;
+            recordBatchMessage(
+              jumpAnchor,
+              target,
+              config,
+              compiledRegex,
+              excludedTerms,
+            );
+            oldestForDateBoundary = jumpAnchor;
+            debugLog('sparse-window-jump', {
+              fromHistoryCursor: debugId(directHistoryCursor),
+              toOwnedMessage: debugId(jumpAnchor.id),
+              timestamp: String(jumpAnchor.timestamp || ''),
+              selectedType: messageType(jumpAnchor),
+              jumpNumber: runState.sparseSearchJumps,
+              batchOwned: runState.batchOwnedMessages,
+            });
+            log(
+              'success',
+              `No deletable message from you appeared in the last ${messages.length.toLocaleString()} history items, so the scanner jumped to your next deletable message at ${formatDate(jumpAnchor.timestamp)}. Undeletable call/system entries do not count toward the batch.`,
+            );
+          }
+        }
         debugLog('history-page-processed', {
           page: runState.scannedPages,
           processedFromPage: batchMessages.length,
@@ -1990,6 +2116,8 @@
           totalInspected: runState.scannedMessages,
           batchInspected: runState.batchScannedMessages,
           batchOwned: runState.batchOwnedMessages,
+          ignoredOwnedSystem: runState.batchIgnoredOwnedSystemMessages,
+          sparseSearchJumps: runState.sparseSearchJumps,
           batchFilterMatches: runState.batchFilterMatches,
         });
         if (
@@ -2000,7 +2128,7 @@
         ) {
           runtime.suspiciousOwnershipWarningShown = true;
           debugLog('suspicious-ownership-count', {
-            reason: 'At most one owned message was recognized after at least 500 anchored history messages.',
+            reason: 'At most one deletable owned message was recognized after at least 500 anchored history items and any available sparse-window jumps.',
             batchInspected: runState.batchScannedMessages,
             batchOwned: runState.batchOwnedMessages,
             authenticatedUser: debugId(runState.userId),
@@ -2013,7 +2141,7 @@
           );
         }
         if (config.afterDate) {
-          const oldestTimestamp = new Date(oldest.timestamp).getTime();
+          const oldestTimestamp = new Date(oldestForDateBoundary.timestamp).getTime();
           if (oldestTimestamp < new Date(config.afterDate).getTime()) {
             reachedDateFloor = true;
             runState.historyComplete = true;
@@ -2024,8 +2152,8 @@
         log(
           'info',
           runState.anchorFound
-            ? `Inspected ${runState.scannedMessages.toLocaleString()} messages total; batch ${runState.batchNumber}: ${runState.batchScannedMessages.toLocaleString()} processed from the anchor, ${runState.batchOwnedMessages.toLocaleString()} authored by your account, ${runState.batchFilterMatches.toLocaleString()} passed filters.`
-            : `Fast-seeking your latest message: inspected and skipped ${runState.skippedNewerMessages.toLocaleString()} newer combined messages; none were authored by your account.`,
+            ? `Inspected ${runState.scannedMessages.toLocaleString()} messages total; batch ${runState.batchNumber}: ${runState.batchScannedMessages.toLocaleString()} processed from the anchor, ${runState.batchOwnedMessages.toLocaleString()} deletable messages authored by your account, ${runState.batchIgnoredOwnedSystemMessages.toLocaleString()} authored call/system entries ignored, ${runState.batchFilterMatches.toLocaleString()} passed filters, ${runState.sparseSearchJumps.toLocaleString()} sparse-window jumps.`
+            : `Fast-seeking your latest deletable message: inspected and skipped ${runState.skippedNewerMessages.toLocaleString()} newer combined messages; none was a deletable message authored by your account.`,
         );
 
         if (reachedDateFloor) break;
@@ -2043,11 +2171,12 @@
         if (batchCapacityReached(config)) {
           log(
             'info',
-            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} of its ${runState.batchScannedMessages.toLocaleString()} processed messages were authored by your authenticated account, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
+            `Batch ${runState.batchNumber} had no queued matches: ${runState.batchOwnedMessages.toLocaleString()} deletable messages were yours, ${runState.batchIgnoredOwnedSystemMessages.toLocaleString()} authored call/system entries were ignored, and ${runState.batchFilterMatches.toLocaleString()} passed the active filters. Continuing to older history.`,
           );
           runState.batchNumber += 1;
           runState.batchScannedMessages = 0;
           runState.batchOwnedMessages = 0;
+          runState.batchIgnoredOwnedSystemMessages = 0;
           runState.batchFilterMatches = 0;
         }
         await interruptibleSleep(jitter(config.scanDelayMs, config.jitterPercent));
@@ -2076,21 +2205,21 @@
         const accountLabel = user.username ? `@${user.username}` : `account ${user.id}`;
         const anchorSummary = runState.batchNumber === 1
           ? runState.anchorMethod === 'search'
-            ? 'started at your latest message found by the fast author-locked lookup'
-            : `started at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages`
+            ? 'started at your latest deletable message found by the fast author-locked lookup'
+            : `started at your latest deletable message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer items`
           : runState.anchorMethod === 'search'
-            ? 'remains anchored below the latest message found by the fast author-locked lookup'
+            ? 'remains anchored below the latest deletable message found by the fast author-locked lookup'
             : `remains anchored below the ${runState.skippedNewerMessages.toLocaleString()} newer messages skipped before batch 1`;
         log(
           'success',
-          `Batch ${runState.batchNumber} ready: ${anchorSummary}; ${runState.batchScannedMessages.toLocaleString()} messages processed; ${runState.batchOwnedMessages.toLocaleString()} authored by ${accountLabel}; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. ${runtime.matchLogs.length.toLocaleString()} matches are displayed in the memory-only matched-message log. Older history has not been scanned yet.`,
+          `Batch ${runState.batchNumber} ready: ${anchorSummary}; ${runState.batchScannedMessages.toLocaleString()} messages processed; ${runState.batchOwnedMessages.toLocaleString()} deletable messages authored by ${accountLabel}; ${runState.batchIgnoredOwnedSystemMessages.toLocaleString()} authored call/system entries ignored; ${runState.sparseSearchJumps.toLocaleString()} sparse-window jumps; ${runState.batchFilterMatches.toLocaleString()} passed filters; ${runState.queue.length.toLocaleString()} queued. ${runtime.matchLogs.length.toLocaleString()} matches are displayed in the memory-only matched-message log. Older history has not been scanned yet.`,
         );
       } else {
         log(
           'success',
           runState.anchorFound
             ? 'History scan complete: no additional matching messages remain.'
-            : `History scan complete: none of the ${runState.scannedMessages.toLocaleString()} inspected messages were authored by the authenticated account.`,
+            : `History scan complete: none of the ${runState.scannedMessages.toLocaleString()} inspected items was a deletable message authored by the authenticated account.`,
         );
       }
       debugLog('scan-finished', {
@@ -2101,6 +2230,8 @@
         inspected: runState.scannedMessages,
         batchInspected: runState.batchScannedMessages,
         batchOwned: runState.batchOwnedMessages,
+        ignoredOwnedSystem: runState.batchIgnoredOwnedSystemMessages,
+        sparseSearchJumps: runState.sparseSearchJumps,
         batchFilterMatches: runState.batchFilterMatches,
         queued: runState.queue.length,
         scanCursor: debugId(runState.scanCursor),
@@ -2116,6 +2247,8 @@
         pages: runState.scannedPages,
         inspected: runState.scannedMessages,
         batchOwned: runState.batchOwnedMessages,
+        ignoredOwnedSystem: runState.batchIgnoredOwnedSystemMessages,
+        sparseSearchJumps: runState.sparseSearchJumps,
         scanCursor: debugId(runState.scanCursor),
       });
       if (error instanceof StopSignal) {
@@ -2145,14 +2278,14 @@
     const phrase = `DELETE ${count} FROM ${runState.target.channelId}`;
     const entered = pageWindow.prompt(
       [
-        `This permanently deletes ${count.toLocaleString()} messages authored by your account`,
+        `This permanently deletes ${count.toLocaleString()} deletable messages authored by your account`,
         `from ${formatTarget(runState.target)}.`,
         runState.anchorMethod === 'search'
-          ? 'Batch 1 began at your latest message found by the fast author-locked lookup.'
-          : `Batch 1 began at your latest message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer messages.`,
+          ? 'Batch 1 began at your latest deletable message found by the fast author-locked lookup.'
+          : `Batch 1 began at your latest deletable message after skipping ${runState.skippedNewerMessages.toLocaleString()} newer items.`,
         `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
         runState.batchMode === 'owned'
-          ? `After this preview, the run continues in batches of ${runState.config.scanBatchSize.toLocaleString()} messages authored by your account.`
+          ? `After this preview, the run continues in batches of ${runState.config.scanBatchSize.toLocaleString()} deletable messages authored by your account; call/system entries never consume capacity.`
           : `This upgraded checkpoint retains its original ${runState.config.scanBatchSize.toLocaleString()}-history-message batch boundary.`,
         '',
         'Deleted messages cannot be recovered.',
@@ -2193,7 +2326,7 @@
       log(
         'success',
         runState.batchMode === 'owned'
-          ? `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}collecting the next ${config.scanBatchSize.toLocaleString()} messages authored by your account.`
+          ? `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}collecting the next ${config.scanBatchSize.toLocaleString()} deletable messages authored by your account.`
           : `${recovered ? 'Recovered completed batch; ' : `Batch ${runState.batchNumber} deleted; `}scanning the next ${config.scanBatchSize.toLocaleString()} combined history messages under the preserved checkpoint mode.`,
       );
     }
@@ -2558,6 +2691,7 @@
     runState.initialMatches = runState.queue.length;
     runState.matchedMessages = runState.queue.length;
     runState.batchOwnedMessages = runState.queue.length;
+    runState.batchIgnoredOwnedSystemMessages = 0;
     runState.batchFilterMatches = runState.queue.length;
     runState.anchorFound = true;
     runState.failed = 0;
@@ -2694,6 +2828,11 @@
     );
     setText('dpe-scanned', runState.scannedMessages.toLocaleString());
     setText('dpe-owned', runState.batchOwnedMessages.toLocaleString());
+    setText(
+      'dpe-ignored-system',
+      runState.batchIgnoredOwnedSystemMessages.toLocaleString(),
+    );
+    setText('dpe-search-jumps', runState.sparseSearchJumps.toLocaleString());
     setText('dpe-filtered', runState.batchFilterMatches.toLocaleString());
     setText('dpe-matched', runState.initialMatches.toLocaleString());
     setText('dpe-remaining', runState.queue.length.toLocaleString());
@@ -2721,7 +2860,7 @@
     setText(
       'dpe-scope-note',
       isDeleteEverythingConfig(prefs)
-        ? 'Default scope: delete every message authored by your account, including pinned and edited messages.'
+        ? 'Default scope: delete every deletable message authored by your account, including pinned and edited messages; undeletable call/system entries are ignored.'
         : 'Custom scope active: one or more filters or preservation limits will exclude messages.',
     );
     const liveSignature = currentUser?.id && target
@@ -3035,7 +3174,7 @@
                   </select>
                 </label>
               </div>
-              <p id="dpe-scope-note" class="hint">Default scope: delete every message authored by your account, including pinned and edited messages.</p>
+              <p id="dpe-scope-note" class="hint">Default scope: delete every deletable message authored by your account, including pinned and edited messages; undeletable call/system entries are ignored.</p>
             </details>
 
             <details>
@@ -3055,7 +3194,7 @@
                     <option value="history">Direct history only</option>
                   </select>
                 </label>
-                <label class="field"><span>Scan, then delete every N of your messages</span><input id="dpe-batch-size" type="number" min="100" max="10000" step="100"></label>
+                <label class="field"><span>Scan, then delete every N deletable messages</span><input id="dpe-batch-size" type="number" min="100" max="10000" step="100"></label>
                 <label class="field">
                   <span>Matched-message log detail</span>
                   <select id="dpe-match-log-mode">
@@ -3076,7 +3215,9 @@
 
           <div class="summary">
             <div class="metric"><b id="dpe-scanned">0</b><span>History total</span></div>
-            <div class="metric"><b id="dpe-owned">0</b><span>Yours / batch</span></div>
+            <div class="metric"><b id="dpe-owned">0</b><span>Deletable yours</span></div>
+            <div class="metric"><b id="dpe-ignored-system">0</b><span>Ignored system</span></div>
+            <div class="metric"><b id="dpe-search-jumps">0</b><span>Search jumps</span></div>
             <div class="metric"><b id="dpe-filtered">0</b><span>Pass filters</span></div>
             <div class="metric"><b id="dpe-matched">0</b><span>Queued batch</span></div>
             <div class="metric"><b id="dpe-remaining">0</b><span>Remaining</span></div>
@@ -3087,7 +3228,7 @@
           <div class="range">Current batch: <span id="dpe-batch">1</span> · newer skipped: <span id="dpe-skipped">0</span> · matched range: <span id="dpe-range">—</span> · pacing: <span id="dpe-pacing">—</span></div>
           <div class="progress"><div id="dpe-progress-bar"></div></div>
           <div class="hint">Processed: <span id="dpe-progress-text">0%</span></div>
-          <div class="hint">Before batch 1, the default author-locked lookup finds your latest message without walking newer partner messages. If Discord search is unavailable or invalid, it automatically falls back to the rate-limit-aware direct-history seek. The scanner then collects the configured number of messages authored by you.</div>
+          <div class="hint">Before batch 1, the author-locked lookup finds your latest deletable message and rejects call/system entries. After the anchor, any full 100-item history page with no deletable message from you triggers a locked search jump to your next one; invalid search results fall back to direct history.</div>
 
           <div class="actions">
             <button id="dpe-scan" class="primary" type="button">1. Dry run / scan</button>

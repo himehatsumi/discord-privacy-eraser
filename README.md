@@ -1,6 +1,6 @@
 # Discord Privacy Eraser
 
-`discord-privacy-eraser.user.js` is a local userscript for previewing and permanently deleting **only messages authored by your signed-in account** in the currently open Discord channel or DM.
+`discord-privacy-eraser.user.js` is a local userscript for previewing and permanently deleting **only deletable messages authored by your signed-in account** in the currently open Discord channel or DM.
 
 [Latest release](https://github.com/himehatsumi/discord-privacy-eraser/releases/latest) · [Changelog](CHANGELOG.md) · [Privacy](PRIVACY.md) · [Security](SECURITY.md)
 
@@ -24,22 +24,22 @@ If the session indicator does not turn green, change to another Discord channel 
 ## Recommended first run
 
 1. Accept the warning.
-2. With no filters, the default scope is every message authored by your account, including pinned and edited messages.
+2. With no filters, the default scope is every normal user-content message authored by your account, including pinned, edited, sticker, voice, attachment, and poll messages. Calls and other system entries are ignored.
 3. Uncheck **Include pinned messages** or add dates, protected phrases, or a small maximum such as `10` only if you want a narrower run.
-4. Leave **Scan, then delete every N of your messages** at `500`, or choose a batch size from `100` to `10,000`.
-5. Click **Dry run / scan**. It snaps to your actual latest message with an author-locked Discord search, then previews the first anchored batch without deleting anything.
+4. Leave **Scan, then delete every N deletable messages** at `500`, or choose a batch size from `100` to `10,000`.
+5. Click **Dry run / scan**. It snaps to your actual latest deletable message with an author-locked Discord search, then previews the first anchored batch without deleting anything.
 6. Review the target lock, matched count, date range, and memory-only matched-message log.
 7. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID.
 
-Messages newer than your latest message are skipped before batch counting begins. A fresh v1.5 run then keeps walking older combined history until it has collected `500` messages authored by your account, rather than stopping after the first `500` messages from both people. This fixes sparse conversations where a combined-history window contained only one of your messages. The preview reports the inspected total, newer messages skipped, processed history count, how many were yours, how many passed filters, and how many were queued. Older history beyond that owned-message boundary is deliberately not scanned until the first reviewed queue is confirmed.
+Messages newer than your latest deletable message are skipped before batch counting begins. The scanner then collects `500` deletable messages authored by your account, rather than stopping after `500` combined history items. Discord call entries have message type `3`, which Discord's [Message Types table](https://docs.discord.com/developers/resources/message#message-object-message-types) marks as non-deletable; they are ignored even when their author field is your account. They cannot anchor a batch, consume capacity, pass filters, or enter the queue. Unknown future message types also fail closed.
 
-After that one confirmation, the script deletes the reviewed matches, collects the next 500 messages authored by you, deletes that batch's filtered matches, and repeats until it reaches the configured maximum, date boundary, or end of history. A batch with no filter matches is skipped without pausing. The maximum deletion setting applies to the entire run, not separately to every batch.
+After a full 100-item history page with no deletable message from you, the default mode performs another exact account- and channel-locked search using that page's oldest ID as `max_id`, jumps to your next older deletable message, and resumes normal history paging there. If that lookup is unavailable or invalid, direct history continues without trusting the result. After confirmation, deletion repeats in 500-message batches until the configured maximum, date boundary, or end of history.
 
 Every filter match in the current batch appears in the matched-message log. Its detail can be set to full text, a 300-character preview, timestamp/ID only, or off. The default is full text. This log exists only in the current page memory: message content is never written into the checkpoint, browser storage, a file, or a network request.
 
 Version 1.5.1 adds a separate **Diagnostics for bug reports** log. It records the search response shape, hashed cursors and identities, page timestamps, anonymized author counts, message types, missing-author counts, pagination transitions, and rate-limit headers. It never includes message text, usernames, raw Discord IDs, credentials, or tokens. If at most one owned message is recognized after 500 anchored history messages, the activity log tells you the diagnostic trace is ready. Stop the scan, click **Copy diagnostics**, and paste the complete block into the bug report. The trace stays in page memory and is copied only when you explicitly press that button.
 
-The default anchor lookup is equivalent to searching the locked channel for messages from the authenticated account, sorted newest first. The returned hit must have the exact `/users/@me` author ID and current channel ID. If Discord search is unavailable, still indexing, or returns an invalid result, the script self-corrects by falling back to direct newest-to-oldest history. That fallback has no fixed timer: it requests the next page as soon as the previous one completes while still obeying live rate-limit headers and HTTP 429 `Retry-After`. Post-anchor batch scanning defaults to 250 ms between pages and remains configurable.
+The default lookup searches the locked channel for the authenticated account, sorted newest first with a maximum of 25 hits. Every accepted hit must match `/users/@me`, the current channel, the optional sparse-window `max_id`, a valid snowflake/timestamp, and the reviewed normal user-content types (`DEFAULT`, `REPLY`, `CHAT_INPUT_COMMAND`, or `CONTEXT_MENU_COMMAND`). Search failures fall back to direct newest-to-oldest history. All paths obey live rate-limit headers and HTTP 429 `Retry-After`.
 
 For a very long history, leave the tab open. Pausing or stopping preserves the exact seek/scan/delete checkpoint. Transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
 
@@ -47,6 +47,7 @@ For a very long history, leave the tab open. Pausing or stopping preserves the e
 
 - Current channel or DM only; no server-wide or all-DM mode.
 - Every candidate must have an author ID equal to `/users/@me`.
+- Every candidate's message type must be in the reviewed user-content allowlist; `CALL`, other system types, and unknown types fail closed.
 - Every queued message ID and history cursor must be a valid Discord snowflake from the locked channel.
 - History pages must be strictly newest-to-oldest; malformed, duplicate, cross-channel, or out-of-order pages pause without partially trusting the page.
 - The saved queue has a target/account/settings-bound checksum to detect accidental checkpoint corruption.
@@ -68,13 +69,13 @@ For a very long history, leave the tab open. Pausing or stopping preserves the e
 - **Must contain:** Only messages containing the text, or matching the optional regular expression.
 - **Always preserve:** A newline-separated list. Any matching message is skipped.
 - **Attachments / links:** Limit deletion to specific message categories.
-- **Include pinned / edited:** Both are on by default so an otherwise unfiltered run means every message authored by you.
+- **Include pinned / edited:** Both are on by default so an otherwise unfiltered run means every deletable message authored by you.
 - **Protect newer than:** Skips recent messages by age in hours.
 - **Maximum deletions:** Caps the complete multi-batch run; `0` is unlimited.
 - **Oldest/newest first:** Controls order and maximum-cap selection inside each scanned batch. Batches themselves always move from newer history toward older history.
-- **Scan, then delete every N of your messages:** Controls how many messages authored by the authenticated account form one batch; the default is exactly `500`. The script may inspect more combined messages to collect them.
+- **Scan, then delete every N deletable messages:** Controls how many eligible messages authored by the authenticated account form one batch; the default is `500`. Call/system entries do not count.
 - **Matched-message log detail:** Shows every filter match in the current batch as full text, a preview, timestamp/ID only, or not at all. It is memory-only.
-- **Latest-message lookup:** Defaults to the fast author-locked search with automatic direct-history fallback. “Direct history only” remains available for troubleshooting.
+- **Latest-message lookup:** Defaults to the fast author-locked search plus sparse-window jumps and automatic direct-history fallback. “Direct history only” disables searches and remains available for troubleshooting.
 - **Batch scan delay:** Adds optional spacing after the owned-message anchor is found. It does not slow the initial rate-limit-aware seek.
 - **Confirm empty history pages:** Requires repeated empty responses before declaring the scan complete.
 - **Invalid requests / 10 min:** Pauses after the configured number of counted 401/403/429 responses; shared-resource 429 responses are excluded.
@@ -83,7 +84,7 @@ Age filters use one fixed timestamp for the entire run, including after pause/re
 
 Version 1.3.1 starts a new preferences generation so older “preserve pinned by default” settings cannot silently contradict the new delete-everything default. Existing interrupted run checkpoints retain their original locked settings and must be cleared or completed separately.
 
-Version 1.5 starts a fresh UI preference generation for owned-message batches and the matched-message log. Existing checkpoints retain their previously reviewed combined-history boundary; **clear the checkpoint and start a new dry scan** to use the corrected behavior.
+Version 1.6 introduces a new queue-eligibility version. Pre-1.6 checkpoints are ignored so an older queue containing an authored call entry can never be resumed for deletion. Start a fresh dry scan after updating.
 
 ## Recovery behavior
 
@@ -95,7 +96,7 @@ Version 1.5 starts a fresh UI preference generation for owned-message batches an
 - Discord DOM replacement is detected and the launcher is remounted without starting a second operation or auto-resume timer.
 - The shadow host is identified as a text-entry surface, and keyboard, paste, composition, pointer, and form-input events stop at the panel boundary so Discord's global handlers do not steal editing from its fields.
 
-Deleting the other person's messages is not possible in a DM. System-generated call/activity entries may also be non-deletable and will appear as failures.
+Deleting the other person's messages is not possible in a DM. Authored call entries and other system message types are ignored before queueing and therefore do not appear as deletion failures.
 
 Discord's message documentation confirms that the normal delete endpoint can delete a message authored by the current user; deleting somebody else's server message requires the separate `MANAGE_MESSAGES` permission. This script does not attempt moderation deletion.
 
@@ -113,7 +114,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
-- Mocked end-to-end scans and deletions covering the one-request author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, the regression where the first 500 combined messages contain only one owned message, redacted diagnostic export, exact mid-page owned boundaries, complete memory-only match logs, no-progress loop guards, panel input isolation, filters, short/empty/out-of-order pages, bounded queues, migrated checkpoints, account changes, preflight failure, persisted cooldowns, mixed invalid responses, HTTP 401, and HTTP 429 recovery.
+- Mocked end-to-end scans and deletions covering call-event exclusion, fail-closed message types, max-ID sparse-window jumps, the author-locked latest-message lookup, safe direct-history fallback, 500-owned-message interleaving, redacted diagnostics, exact mid-page boundaries, complete memory-only match logs, checkpoint invalidation, no-progress guards, panel input isolation, filters, malformed pages, account changes, persisted cooldowns, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 - Release-consistency checks that keep the package, userscript metadata, runtime version, changelog, and README release links aligned.
 
@@ -123,6 +124,6 @@ See [PRIVACY.md](PRIVACY.md) for the data-flow description and [SECURITY.md](SEC
 
 ## Research and audit notes
 
-The reliability design was informed by the open-source Undiscord project and a maintained fork, especially their author-filtered search shape, pagination, empty-history handling, checkpointing, UI-mount failures, match previews, and rate-limit parsing patterns. Their source was independently checked for remote code loading, third-party network requests, token handling, and destructive scope before using these ideas. This script uses Discord search only to snap to the newest strictly validated owned message, then switches to direct channel-history pagination for the deletion batches.
+The reliability design was informed by the open-source Undiscord project and a maintained fork, especially their author-filtered search shape, pagination, empty-history handling, checkpointing, UI-mount failures, match previews, and rate-limit parsing patterns. Their source was independently checked for remote code loading, third-party network requests, token handling, and destructive scope before using these ideas. This script uses Discord search to find the newest eligible message and to skip only full sparse history windows, with exact account/channel/cursor validation before every jump.
 
 This implementation is original and intentionally omits token copy/paste controls, media backup, server-wide deletion, all-DM deletion, remote icons/dependencies, and log downloads.

@@ -18,6 +18,7 @@ const exportBlock = `
     getRuntime: () => runtime,
     historyPageDiagnostics,
     isolatePanelEvents,
+    isDeletableOwnedMessage,
     isDeleteEverythingConfig,
     markShadowHostAsTextEntry,
     matchesMessage,
@@ -67,6 +68,8 @@ function message({
   channelId = TARGET_CHANNEL,
   attachments = [],
   embeds = [],
+  type = 0,
+  call,
 }) {
   return {
     id: String(id),
@@ -77,6 +80,8 @@ function message({
     timestamp,
     attachments,
     embeds,
+    type,
+    ...(call ? { call } : {}),
     edited_timestamp: null,
   };
 }
@@ -289,11 +294,26 @@ async function testApiAllowlistBindsMethodPathAndBody() {
     userId: USER_A.id,
   });
   await harness.test.apiRequest(
-    `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_A.id}&sort_by=timestamp&sort_order=desc&offset=0`,
+    `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_A.id}&sort_by=timestamp&sort_order=desc&offset=0&limit=25`,
+  );
+  await harness.test.apiRequest(
+    `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_A.id}&sort_by=timestamp&sort_order=desc&max_id=123&offset=0&limit=25`,
   );
   await assert.rejects(
     () => harness.test.apiRequest(
-      `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_B.id}&sort_by=timestamp&sort_order=desc&offset=0`,
+      `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_B.id}&sort_by=timestamp&sort_order=desc&offset=0&limit=25`,
+    ),
+    /Blocked an unexpected Discord API method, path, or body/,
+  );
+  await assert.rejects(
+    () => harness.test.apiRequest(
+      `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_A.id}&sort_by=timestamp&sort_order=desc&max_id=not-a-snowflake&offset=0&limit=25`,
+    ),
+    /Blocked an unexpected Discord API method, path, or body/,
+  );
+  await assert.rejects(
+    () => harness.test.apiRequest(
+      `/channels/${TARGET_CHANNEL}/messages/search?author_id=${USER_A.id}&sort_by=timestamp&sort_order=desc&max_id=123&max_id=122&offset=0&limit=25`,
     ),
     /Blocked an unexpected Discord API method, path, or body/,
   );
@@ -305,8 +325,8 @@ async function testApiAllowlistBindsMethodPathAndBody() {
   );
   assert.equal(
     harness.calls.length,
-    2,
-    'only a canonical history request and the exact account/target-bound author lookup may reach the network',
+    3,
+    'only canonical history and exact account/target-bound author lookups may reach the network',
   );
 }
 
@@ -722,6 +742,8 @@ async function testFastAuthorLookupSnapsToLatestOwnedMessage() {
       assert.equal(parsed.searchParams.get('sort_by'), 'timestamp');
       assert.equal(parsed.searchParams.get('sort_order'), 'desc');
       assert.equal(parsed.searchParams.get('offset'), '0');
+      assert.equal(parsed.searchParams.get('limit'), '25');
+      assert.equal(parsed.searchParams.get('max_id'), null);
       return response({ total_results: 100, messages: [[anchor]] });
     }
     if (
@@ -765,6 +787,215 @@ async function testFastAuthorLookupSnapsToLatestOwnedMessage() {
   assert.equal(searchDiagnostic.ownedHitCount, 1);
   assert.equal(searchDiagnostic.selectedAuthorMatches, true);
   assert.match(searchDiagnostic.selectedAnchor, /^id#[0-9a-f]{8}:4d$/);
+}
+
+async function testCallEventsAreIgnoredAndSparseWindowsJumpToNextDeletableMessage() {
+  const harness = makeHarness({
+    scanBatchSize: 100,
+    scanDelayMs: 0,
+    anchorLookupMode: 'search',
+  });
+  const latestCall = message({
+    id: '1100',
+    type: 3,
+    author: USER_A,
+    timestamp: '2026-01-01T00:18:20.000Z',
+    call: { participants: [USER_A.id, USER_B.id] },
+  });
+  latestCall.hit = true;
+  const latestText = message({
+    id: '1000',
+    type: 0,
+    author: USER_A,
+    content: 'latest real text',
+    timestamp: '2026-01-01T00:16:40.000Z',
+  });
+  latestText.hit = true;
+  const nextText = message({
+    id: '800',
+    type: 0,
+    author: USER_A,
+    content: 'next real text after sparse window',
+    timestamp: '2026-01-01T00:13:20.000Z',
+  });
+  nextText.hit = true;
+
+  const sparsePage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(999 - index),
+    type: index === 0 ? 3 : 0,
+    author: index === 0 ? USER_A : USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 999 - index)).toISOString(),
+    ...(index === 0 ? { call: { participants: [USER_A.id] } } : {}),
+  }));
+  const olderOwnedPage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(799 - index),
+    type: 0,
+    author: USER_A,
+    content: `older owned ${799 - index}`,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 799 - index)).toISOString(),
+  }));
+
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes('/messages/search?')) {
+      const parsed = new URL(url);
+      assert.equal(parsed.searchParams.get('author_id'), USER_A.id);
+      assert.equal(parsed.searchParams.get('limit'), '25');
+      const maxId = parsed.searchParams.get('max_id');
+      if (!maxId) {
+        return response({ total_results: 2, messages: [[latestCall], [latestText]] });
+      }
+      assert.equal(maxId, '900');
+      return response({ total_results: 1, messages: [[nextText]] });
+    }
+    if (
+      method === 'GET'
+      && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && historyBefore(url) === '1000'
+    ) {
+      return response(sparsePage);
+    }
+    if (
+      method === 'GET'
+      && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && historyBefore(url) === '800'
+    ) {
+      return response(olderOwnedPage);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  assert.equal(harness.test.isDeletableOwnedMessage(latestCall, USER_A.id), false);
+  assert.equal(harness.test.isDeletableOwnedMessage(latestText, USER_A.id), true);
+  assert.equal(
+    harness.test.isDeletableOwnedMessage(
+      message({ id: '1099', type: 19, author: USER_A, timestamp: '2026-01-01T00:18:19.000Z' }),
+      USER_A.id,
+    ),
+    true,
+  );
+  assert.equal(
+    harness.test.isDeletableOwnedMessage(
+      message({ id: '1097', type: 6, author: USER_A, timestamp: '2026-01-01T00:18:17.000Z' }),
+      USER_A.id,
+    ),
+    false,
+    'deletable system notifications must not be treated as authored content',
+  );
+  assert.equal(
+    harness.test.isDeletableOwnedMessage(
+      message({ id: '1098', type: 999, author: USER_A, timestamp: '2026-01-01T00:18:18.000Z' }),
+      USER_A.id,
+    ),
+    false,
+    'unknown future message types must fail closed',
+  );
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  const runtime = harness.test.getRuntime();
+
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.anchorMethod, 'search');
+  assert.equal(state.batchOwnedMessages, 100);
+  assert.equal(state.batchIgnoredOwnedSystemMessages, 1);
+  assert.equal(state.sparseSearchJumps, 1);
+  assert.equal(state.queue.length, 100);
+  assert.equal(state.scannedMessages, 200);
+  assert.equal(state.scanCursor, '702');
+  assert.ok(!state.queue.some((item) => item.id === latestCall.id));
+  assert.ok(!state.queue.some((item) => item.id === '999'));
+  assert.ok(state.queue.some((item) => item.id === latestText.id));
+  assert.ok(state.queue.some((item) => item.id === nextText.id));
+  assert.equal(
+    harness.calls.filter((call) => call.url.includes('/messages/search?')).length,
+    2,
+  );
+
+  const diagnostics = runtime.debugLogs.map((line) => JSON.parse(line));
+  const initialSearch = diagnostics.find(
+    (entry) => entry.event === 'search-response' && entry.maxId === 'missing',
+  );
+  assert.equal(initialSearch.ownedHitCount, 1);
+  assert.equal(initialSearch.ignoredOwnedSystemHits, 1);
+  assert.equal(initialSearch.selectedType, 0);
+  assert.ok(diagnostics.some((entry) => entry.event === 'sparse-window-jump'));
+}
+
+async function testSparseJumpRejectsOutOfBoundsHitAndContinuesDirectHistory() {
+  const harness = makeHarness({
+    scanBatchSize: 100,
+    scanDelayMs: 0,
+    anchorLookupMode: 'search',
+  });
+  const latestText = message({
+    id: '1000',
+    author: USER_A,
+    content: 'latest real text',
+    timestamp: '2026-01-01T00:16:40.000Z',
+  });
+  latestText.hit = true;
+  const outOfBoundsHit = message({
+    id: '950',
+    author: USER_A,
+    content: 'must be rejected because it is newer than max_id',
+    timestamp: '2026-01-01T00:15:50.000Z',
+  });
+  outOfBoundsHit.hit = true;
+  const sparsePage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(999 - index),
+    author: USER_B,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 999 - index)).toISOString(),
+  }));
+  const directOlderPage = Array.from({ length: 100 }, (_, index) => message({
+    id: String(899 - index),
+    author: USER_A,
+    content: `direct older ${899 - index}`,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 899 - index)).toISOString(),
+  }));
+
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes('/messages/search?')) {
+      const maxId = new URL(url).searchParams.get('max_id');
+      return response({
+        total_results: 1,
+        messages: [[maxId ? outOfBoundsHit : latestText]],
+      });
+    }
+    if (
+      method === 'GET'
+      && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && historyBefore(url) === '1000'
+    ) {
+      return response(sparsePage);
+    }
+    if (
+      method === 'GET'
+      && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && historyBefore(url) === '900'
+    ) {
+      return response(directOlderPage);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  const diagnostics = harness.test.getRuntime().debugLogs.map((line) => JSON.parse(line));
+
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.sparseSearchJumps, 0);
+  assert.equal(state.batchOwnedMessages, 100);
+  assert.equal(state.queue.length, 100);
+  assert.ok(!state.queue.some((item) => item.id === outOfBoundsHit.id));
+  assert.ok(harness.calls.some(
+    (call) => call.url.includes(`/channels/${TARGET_CHANNEL}/messages?`)
+      && historyBefore(call.url) === '900',
+  ));
+  assert.ok(!diagnostics.some((entry) => entry.event === 'sparse-window-jump'));
 }
 
 async function testFastAuthorLookupFallsBackOnInvalidHit() {
@@ -1056,7 +1287,6 @@ async function testCompactCheckpointRestoresLockedChannel() {
   delete serialized.config.scanBatchSize;
   delete serialized.config.matchLogMode;
   delete serialized.config.anchorLookupMode;
-  delete serialized.batchMode;
   delete serialized.anchorMethod;
   delete serialized.historyComplete;
   serialized.signature = first.test.configSignature(
@@ -1078,11 +1308,11 @@ async function testCompactCheckpointRestoresLockedChannel() {
   assert.equal(restored.config.scanBatchSize, 500);
   assert.equal(restored.config.matchLogMode, 'full');
   assert.equal(restored.config.anchorLookupMode, 'search');
-  assert.equal(restored.batchMode, 'history');
+  assert.equal(restored.batchMode, 'owned');
   assert.equal(
     restored.historyComplete,
     true,
-    'upgrading a pre-batch checkpoint must not expand its previously confirmed scope',
+    'a migrated checkpoint without a history marker must not expand its reviewed scope',
   );
   assert.notEqual(
     restored.queueDigest,
@@ -1094,6 +1324,25 @@ async function testCompactCheckpointRestoresLockedChannel() {
     reloaded.test.configSignature(restored.config, restored.target, restored.userId),
     'adding safe defaults must migrate the checkpoint signature',
   );
+}
+
+function testPreEligibilityCheckpointIsInvalidated() {
+  const harness = makeHarness();
+  const oldCheckpoint = {
+    ...harness.test.emptyRunState(),
+    status: 'scanned',
+    target: { guildId: '@me', channelId: TARGET_CHANNEL, kind: 'DM / group DM' },
+    userId: USER_A.id,
+    queue: [['999', '2026-01-01T00:00:00.000Z']],
+  };
+  delete oldCheckpoint.eligibilityVersion;
+  harness.stored.set('dpe:run:v1', JSON.stringify(oldCheckpoint));
+
+  const reloaded = makeHarness({}, harness.stored);
+  const restored = reloaded.test.getRunState();
+  assert.equal(restored.status, 'idle');
+  assert.equal(restored.queue.length, 0);
+  assert.equal(restored.eligibilityVersion, 2);
 }
 
 async function testPersistedCooldownSurvivesReload() {
@@ -1555,6 +1804,8 @@ async function main() {
   await testCustomBatchNeverOvershoots();
   await testOwnedBatchDoesNotStopAtOneMatchInFirstFiveHundredHistoryMessages();
   await testFastAuthorLookupSnapsToLatestOwnedMessage();
+  await testCallEventsAreIgnoredAndSparseWindowsJumpToNextDeletableMessage();
+  await testSparseJumpRejectsOutOfBoundsHitAndContinuesDirectHistory();
   await testFastAuthorLookupFallsBackOnInvalidHit();
   await testFirstBatchAnchorsAtLatestOwnedMessage();
   await testLatestMessageSeekHasNoFixedDelay();
@@ -1563,6 +1814,7 @@ async function main() {
   await testCompletedBoundaryCheckpointDoesNotOverscan();
   await testEmptyDeletionCheckpointAdvancesSafely();
   await testCompactCheckpointRestoresLockedChannel();
+  testPreEligibilityCheckpointIsInvalidated();
   await testPersistedCooldownSurvivesReload();
   testFilterMatrix();
   testQueueOrderingAndConfigValidation();

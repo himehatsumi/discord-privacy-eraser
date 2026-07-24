@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## [1.6.0](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.6.0) — 2026-07-24
+
+- Stopped treating Discord `CALL` messages (type `3`) and other documented non-deletable message types as owned deletion candidates, batch capacity, anchors, filter matches, or queued IDs.
+- Added a fail-closed normal user-content type allowlist (`DEFAULT`, `REPLY`, `CHAT_INPUT_COMMAND`, and `CONTEXT_MENU_COMMAND`); all system and unknown future types are excluded until reviewed.
+- Changed the initial author search to select the newest strictly validated **deletable** message from the authenticated account, ignoring newer call/system hits.
+- Added a locked sparse-window jump: after a full 100-item history page contains no deletable message from the account, the scanner searches before that page's cursor with the exact account/channel/max-ID lock and jumps to the next older deletable message.
+- Kept direct-history pagination as the fallback whenever a sparse-window search is unavailable, indexing, malformed, out of bounds, or has no eligible hit.
+- Added ignored-system and sparse-jump counters, activity/diagnostic reporting, and a new checkpoint eligibility version so pre-1.6 queues containing call entries cannot be resumed for deletion.
+- Added regression coverage for a newer authored call hit, a call-only sparse window, a max-ID search jump, exact batch capacity, queue exclusion, unknown message types, and old-checkpoint invalidation.
+
 ## [1.5.1](https://github.com/himehatsumi/discord-privacy-eraser/releases/tag/v1.5.1) — 2026-07-24
 
 - Added a separate memory-only diagnostics log for investigating incorrect ownership counts without exposing message text, usernames, raw account/channel/message IDs, credentials, or tokens.

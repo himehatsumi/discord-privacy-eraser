@@ -9,7 +9,7 @@ The userscript reads:
 - The current Discord channel or DM ID from the browser URL.
 - The signed-in account ID from Discord's `/users/@me` API response.
 - Channel message history returned by Discord while a dry scan is running.
-- The newest author-filtered search hit used to anchor a fresh run, unless direct-history-only mode is selected.
+- Author-filtered search hits used to anchor a fresh run and to jump past full 100-item windows with no deletable owned message, unless direct-history-only mode is selected.
 - Discord rate-limit response headers.
 - The existing in-memory authorization header used by the Discord web client.
 
@@ -41,7 +41,7 @@ The source includes defensive token redaction for local log messages.
 
 Preferences and recovery checkpoints are stored only using the userscript manager's private value storage. There is deliberately no page-readable `localStorage` fallback for settings or deletion queues. If private userscript storage is unavailable or full, the current run may continue in memory, but reload recovery is unavailable.
 
-Version 1.5 uses a new preferences key to establish owned-message batches and the matched-message log controls. Older private preference values are not read; existing locked run checkpoints remain separate and retain their original reviewed batch mode.
+Version 1.6 adds a queue-eligibility version. Checkpoints created before the documented message-type gate are ignored, preventing an older queue containing an authored call entry from being resumed for deletion. Preferences remain private and separate from run checkpoints.
 
 Version 1.1 also removes the two namespaced page-storage keys that version 1.0 could have created when private userscript storage was unavailable. It does not remove or modify Discord's own storage keys.
 
@@ -53,8 +53,9 @@ A checkpoint may contain:
 - Queued message IDs and timestamps.
 - Progress counters and failed message IDs.
 - The current batch number, scan cursor, batch capacity, and whether end-of-history was confirmed.
-- Whether the checkpoint uses the current owned-message boundary or a preserved pre-1.5 combined-history boundary.
-- Whether the latest owned-message anchor was found, whether search or direct history found it, and how many newer messages were skipped by the direct-history fallback.
+- Whether the latest deletable owned-message anchor was found, whether search or direct history found it, and how many newer items were skipped by the direct-history fallback.
+- How many authored non-deletable call/system entries were ignored and how many sparse-window search jumps succeeded.
+- The queue-eligibility version that prevents pre-type-gate checkpoints from resuming.
 - A non-cryptographic queue-integrity checksum.
 - Rate-limit deadlines, learned pacing, and recent invalid-request timestamps.
 
