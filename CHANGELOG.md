@@ -2,6 +2,21 @@
 
 All notable changes are documented here.
 
+## 1.2.0 — 2026-07-24
+
+- Continued direct history scans across short non-empty pages and added configurable repeated-empty confirmation.
+- Added strict newest-to-oldest page validation before any item on a page can enter the queue.
+- Bounded oldest-first capped scans to the selected working set, reducing memory and checkpoint size on very long histories.
+- Persisted active cooldown deadlines and learned deletion pacing across reloads.
+- Added adaptive fallback waits when Discord returns an unrealistically short or missing retry interval.
+- Added a persisted rolling circuit breaker for counted 401/403/429 responses.
+- Made minimum-age filtering deterministic across long scans and resumed checkpoints.
+- Added a target/account/settings-bound queue checksum and backward-compatible checkpoint migration.
+- Bound the irreversible confirmation phrase to the locked channel ID and included the selected date range.
+- Fixed new-scan preflight failures overwriting an unrelated existing checkpoint.
+- Remounted the launcher after Discord replaces its page DOM without duplicating active work or auto-resume timers.
+- Expanded integration coverage for partial pages, transient empties, out-of-order data, bounded queues, migrated checkpoints, stale targets, persisted cooldowns, and mixed invalid responses.
+
 ## 1.1.0 — 2026-07-24
 
 - Added mocked end-to-end coverage for scans, filters, capped queue ordering, deletion, rate-limit recovery, authentication failure, account switching, malformed history, and corrupted queues.

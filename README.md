@@ -26,21 +26,24 @@ If the session indicator does not turn green, change to another Discord channel 
 3. Optionally add dates, protected phrases, or a small maximum such as `10`.
 4. Click **Dry run / scan**. This does not delete anything.
 5. Review the target lock, matched count, and date range.
-6. Click **Delete queued…** and type the exact confirmation phrase shown.
+6. Click **Delete queued…** and type the exact confirmation phrase, including the locked channel ID.
 
-For a very long history, leave the tab open. Pausing or stopping preserves a checkpoint. HTTP 429 responses respect Discord's `Retry-After`; transient network and server errors use exponential backoff. The script also learns pacing from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
+For a very long history, leave the tab open. Pausing or stopping preserves a checkpoint. HTTP 429 responses respect Discord's `Retry-After`; transient network and server errors use exponential backoff. Learned pacing and active cooldown deadlines survive reloads. The script also learns from [Discord's documented rate-limit response headers](https://docs.discord.com/developers/topics/rate-limits).
 
 ## Safety properties
 
 - Current channel or DM only; no server-wide or all-DM mode.
 - Every candidate must have an author ID equal to `/users/@me`.
 - Every queued message ID and history cursor must be a valid Discord snowflake from the locked channel.
+- History pages must be strictly newest-to-oldest; malformed, duplicate, cross-channel, or out-of-order pages pause without partially trusting the page.
+- The saved queue has a target/account/settings-bound checksum to detect accidental checkpoint corruption.
 - The signed-in identity is rechecked before deletion; an account change stops the run before another message is touched.
-- Dry run and typed confirmation are mandatory before a new deletion.
+- Dry run and a target-bound typed confirmation are mandatory before a new deletion.
 - Pinned messages are protected by default.
 - Navigation away pauses the run by default.
 - No remote dependencies, update URL, telemetry, attachment downloads, or third-party requests.
 - A method-and-path allowlist permits only identity/history reads and deletion of a single queued message.
+- A rolling invalid-request circuit breaker pauses before mixed 401/403/429 responses can accumulate unchecked.
 - The Discord authorization token is held only in memory and never shown, logged, copied, exported, or persisted.
 - Checkpoints store only settings, target/message IDs, timestamps, and counters in userscript-manager storage.
 
@@ -53,6 +56,10 @@ For a very long history, leave the tab open. Pausing or stopping preserves a che
 - **Protect newer than:** Skips recent messages by age in hours.
 - **Maximum deletions:** Caps the dry-run queue; `0` is unlimited.
 - **Oldest/newest first:** Controls both deletion order and which messages a maximum cap selects.
+- **Confirm empty history pages:** Requires repeated empty responses before declaring the scan complete.
+- **Invalid requests / 10 min:** Pauses after the configured number of counted 401/403/429 responses; shared-resource 429 responses are excluded.
+
+Age filters use one fixed timestamp for the entire dry run, including after pause/reload. Capped oldest-first scans retain only the bounded working set instead of keeping every match in memory.
 
 ## Recovery behavior
 
@@ -61,6 +68,7 @@ For a very long history, leave the tab open. Pausing or stopping preserves a che
 - **Resume:** Continues an interrupted scan or confirmed deletion.
 - **Retry failures:** Moves HTTP 400/403 failures back into a new review queue.
 - **Auto-resume:** Off by default. If enabled, an interrupted confirmed deletion resumes after a 10-second grace period; **Stop** cancels it.
+- Discord DOM replacement is detected and the launcher is remounted without starting a second operation or auto-resume timer.
 
 Deleting the other person's messages is not possible in a DM. System-generated call/activity entries may also be non-deletable and will appear as failures.
 
@@ -80,7 +88,7 @@ The test suite performs:
 
 - JavaScript syntax validation.
 - A sandboxed initialization and network-wrapper smoke test.
-- Mocked end-to-end scans and deletions covering filters, queue ordering, account changes, malformed history, HTTP 401, and HTTP 429 recovery.
+- Mocked end-to-end scans and deletions covering filters, short/empty/out-of-order pages, bounded queues, migrated checkpoints, account changes, preflight failure, persisted cooldowns, mixed invalid responses, HTTP 401, and HTTP 429 recovery.
 - Static security-invariant checks for remote code, third-party request primitives, author verification, target locking, typed confirmation, and rate-limit handling.
 
 GitHub Actions runs the same checks on every push and pull request.
@@ -89,6 +97,6 @@ See [PRIVACY.md](PRIVACY.md) for the data-flow description and [SECURITY.md](SEC
 
 ## Research and audit notes
 
-The reliability design was informed by the open-source Undiscord project and a maintained fork, especially their history pagination, empty-history handling, checkpointing, and rate-limit parsing patterns. Their source was independently checked for remote code loading, third-party network requests, token handling, and destructive scope before using these ideas.
+The reliability design was informed by the open-source Undiscord project and a maintained fork, especially their pagination, empty-history handling, checkpointing, UI-mount failures, and rate-limit parsing patterns. Their source was independently checked for remote code loading, third-party network requests, token handling, and destructive scope before using these ideas. This script uses direct channel-history pagination rather than Discord's search index.
 
 This implementation is original and intentionally omits token copy/paste controls, media backup, server-wide deletion, all-DM deletion, remote icons/dependencies, and log downloads.

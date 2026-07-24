@@ -16,6 +16,7 @@ const exportBlock = `
     getRuntime: () => runtime,
     matchesMessage,
     prepareQueue,
+    recordInvalidRequest,
     resolveCurrentUser,
     retryAfterMs,
     setCurrentUser: (value) => { currentUser = value; },
@@ -76,6 +77,7 @@ function message({
 function makeHarness(prefsOverride = {}, storedSeed = null) {
   const stored = storedSeed ? new Map(storedSeed) : new Map();
   const calls = [];
+  const prompts = [];
   let fetchHandler = async () => {
     throw new Error('Unexpected fetch call.');
   };
@@ -102,7 +104,10 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
       setItem: () => {},
       removeItem: () => {},
     },
-    prompt: (text) => text.match(/Type exactly: (DELETE \d+)/)?.[1] || '',
+    prompt: (text) => {
+      prompts.push(text);
+      return text.match(/Type exactly: (.+)/)?.[1]?.trim() || '';
+    },
     confirm: () => true,
   };
 
@@ -127,6 +132,8 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     maxRetries: 2,
     stopAfterErrors: 2,
     checkpointEvery: 1,
+    emptyPageConfirmations: 1,
+    maxInvalidRequestsPer10Minutes: 20,
     pauseOnNavigate: true,
     autoResume: false,
     riskAccepted: true,
@@ -178,12 +185,17 @@ function makeHarness(prefsOverride = {}, storedSeed = null) {
     calls,
     pageWindow,
     prefs,
+    prompts,
     setFetchHandler(handler) {
       fetchHandler = handler;
     },
     stored,
     test: context.__DPE_TEST__,
   };
+}
+
+function historyBefore(url) {
+  return new URL(url).searchParams.get('before');
 }
 
 async function testCredentialSnifferIgnoresThirdParties() {
@@ -227,12 +239,6 @@ async function testCappedScanAndDelete() {
   const middle = '2026-07-02T12:00:00.000Z';
   const oldest = '2026-07-01T12:00:00.000Z';
   const history = [
-    message({
-      id: '350',
-      content: 'wrong channel',
-      timestamp: newest,
-      channelId: '999999999999999999',
-    }),
     message({ id: '300', content: 'newest own', timestamp: newest }),
     message({ id: '250', author: USER_B, content: 'not ours', timestamp: newest }),
     message({ id: '200', content: 'middle own', timestamp: middle }),
@@ -243,7 +249,7 @@ async function testCappedScanAndDelete() {
   harness.setFetchHandler(async ({ url, method }) => {
     if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
-      return response(history);
+      return response(historyBefore(url) ? [] : history);
     }
     if (method === 'DELETE' && url.endsWith('/messages/100')) return response(null, 204);
     throw new Error(`Unexpected ${method} ${url}`);
@@ -279,6 +285,175 @@ async function testCappedScanAndDelete() {
     harness.calls.filter((call) => call.method === 'DELETE').length,
     1,
   );
+  assert.match(
+    harness.prompts[0],
+    new RegExp(`Type exactly: DELETE 1 FROM ${TARGET_CHANNEL}`),
+    'the irreversible confirmation must encode the locked channel',
+  );
+}
+
+async function testShortPagesContinueUntilConfirmedEmpty() {
+  const harness = makeHarness({ emptyPageConfirmations: 2 });
+  let terminalEmptyResponses = 0;
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      const before = historyBefore(url);
+      if (!before) {
+        return response([
+          message({ id: '300', timestamp: '2026-07-03T00:00:00.000Z' }),
+          message({ id: '250', timestamp: '2026-07-02T00:00:00.000Z' }),
+        ]);
+      }
+      if (before === '250') {
+        return response([
+          message({ id: '100', timestamp: '2026-07-01T00:00:00.000Z' }),
+        ]);
+      }
+      if (before === '100') {
+        terminalEmptyResponses += 1;
+        return response([]);
+      }
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'scanned');
+  assert.deepEqual(
+    Array.from(state.queue, (item) => item.id),
+    ['100', '250', '300'],
+    'a short non-empty page must not be treated as the end of history',
+  );
+  assert.equal(terminalEmptyResponses, 2, 'end-of-history should require confirmation');
+}
+
+async function testTransientEmptyPageDoesNotEndScan() {
+  const harness = makeHarness({ emptyPageConfirmations: 2 });
+  let initialAttempts = 0;
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      const before = historyBefore(url);
+      if (!before) {
+        initialAttempts += 1;
+        if (initialAttempts === 1) return response([]);
+        return response([
+          message({ id: '600', timestamp: '2026-07-01T00:00:00.000Z' }),
+        ]);
+      }
+      return response([]);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'scanned');
+  assert.deepEqual(Array.from(state.queue, (item) => item.id), ['600']);
+  assert.equal(initialAttempts, 2);
+}
+
+async function testNewScanIgnoresStaleCheckpointTarget() {
+  const harness = makeHarness();
+  harness.test.setRunState({
+    ...harness.test.emptyRunState(),
+    status: 'scanned',
+    target: {
+      guildId: '@me',
+      channelId: '999999999999999999',
+      kind: 'DM / group DM',
+    },
+    config: { ...harness.prefs },
+  });
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
+      return response([
+        message({ id: '610', timestamp: '2026-07-01T00:00:00.000Z' }),
+      ]);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.target.channelId, TARGET_CHANNEL);
+  assert.deepEqual(Array.from(state.queue, (item) => item.id), ['610']);
+}
+
+async function testFailedScanPreflightPreservesExistingCheckpoint() {
+  const harness = makeHarness();
+  const oldTarget = {
+    guildId: '@me',
+    channelId: '999999999999999999',
+    kind: 'DM / group DM',
+  };
+  harness.test.setRunState({
+    ...harness.test.emptyRunState(),
+    status: 'scanned',
+    target: oldTarget,
+    config: { ...harness.prefs },
+    queue: [{
+      id: '777',
+      channelId: oldTarget.channelId,
+      timestamp: '2026-07-01T00:00:00.000Z',
+    }],
+  });
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) {
+      return response({ message: 'Unauthorized' }, 401);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'scanned');
+  assert.equal(state.target.channelId, oldTarget.channelId);
+  assert.deepEqual(Array.from(state.queue, (item) => item.id), ['777']);
+}
+
+async function testOldestCapBoundsWorkingQueue() {
+  const harness = makeHarness({ maxMessages: 2, deleteOrder: 'oldest' });
+  let checkedWorkingSet = false;
+  const makePage = (high, low) => Array.from(
+    { length: high - low + 1 },
+    (_, index) => message({
+      id: String(high - index),
+      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, high - index)).toISOString(),
+    }),
+  );
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      const before = historyBefore(url);
+      if (!before) return response(makePage(300, 201));
+      if (before === '201') {
+        assert.ok(
+          harness.test.getRunState().queue.length <= 2,
+          'capped oldest-first scans must prune the working queue after each page',
+        );
+        checkedWorkingSet = true;
+        return response(makePage(200, 101));
+      }
+      if (before === '101') return response([]);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(checkedWorkingSet, true);
+  assert.deepEqual(Array.from(state.queue, (item) => item.id), ['101', '102']);
 }
 
 async function testCompactCheckpointRestoresLockedChannel() {
@@ -286,6 +461,7 @@ async function testCompactCheckpointRestoresLockedChannel() {
   first.setFetchHandler(async ({ url, method }) => {
     if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
       return response([
         message({ id: '400', content: 'recover me', timestamp: '2026-07-01T12:00:00.000Z' }),
       ]);
@@ -298,6 +474,15 @@ async function testCompactCheckpointRestoresLockedChannel() {
   const serialized = JSON.parse(first.stored.get('dpe:run:v1'));
   assert.ok(Array.isArray(serialized.queue[0]), 'stored queues should use the compact tuple format');
   assert.equal(serialized.queue[0].length, 2);
+  delete serialized.config.emptyPageConfirmations;
+  delete serialized.config.maxInvalidRequestsPer10Minutes;
+  serialized.signature = first.test.configSignature(
+    serialized.config,
+    serialized.target,
+    serialized.userId,
+  );
+  delete serialized.queueDigest;
+  first.stored.set('dpe:run:v1', JSON.stringify(serialized));
 
   const reloaded = makeHarness({}, first.stored);
   const restored = reloaded.test.getRunState();
@@ -305,6 +490,57 @@ async function testCompactCheckpointRestoresLockedChannel() {
   assert.equal(restored.queue.length, 1);
   assert.equal(restored.queue[0].id, '400');
   assert.equal(restored.queue[0].channelId, TARGET_CHANNEL);
+  assert.equal(restored.config.emptyPageConfirmations, 2);
+  assert.equal(restored.config.maxInvalidRequestsPer10Minutes, 20);
+  assert.ok(restored.queueDigest, 'older checkpoints should receive a queue checksum on load');
+  assert.equal(
+    restored.signature,
+    reloaded.test.configSignature(restored.config, restored.target, restored.userId),
+    'adding safe defaults must migrate the checkpoint signature',
+  );
+}
+
+async function testPersistedCooldownSurvivesReload() {
+  const first = makeHarness();
+  first.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
+      return response([
+        message({ id: '410', content: 'cool down', timestamp: '2026-07-01T12:00:00.000Z' }),
+      ]);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+  first.test.acceptToken(TOKEN_A);
+  await first.test.startScan();
+
+  const saved = JSON.parse(first.stored.get('dpe:run:v1'));
+  const cooldownUntil = Date.now() + 650;
+  saved.rateLimitUntil = cooldownUntil;
+  saved.learnedDeleteDelayMs = 900;
+  first.stored.set('dpe:run:v1', JSON.stringify(saved));
+
+  const reloaded = makeHarness({}, first.stored);
+  let firstRequestAt = 0;
+  reloaded.setFetchHandler(async ({ url, method }) => {
+    if (!firstRequestAt) firstRequestAt = Date.now();
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'DELETE' && url.endsWith('/messages/410')) return response(null, 204);
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+  reloaded.test.acceptToken(TOKEN_A);
+  const startedAt = Date.now();
+  await reloaded.test.startDelete();
+
+  assert.ok(
+    firstRequestAt - startedAt >= 550,
+    'a reload must not discard an active Discord cooldown window',
+  );
+  assert.ok(
+    reloaded.test.getRuntime().adaptiveDeleteDelayMs >= 900,
+    'learned deletion pacing should survive reload',
+  );
 }
 
 async function testAccountSwitchFailsClosed() {
@@ -315,6 +551,7 @@ async function testAccountSwitchFailsClosed() {
       return response(activeIdentity);
     }
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
       return response([
         message({ id: '500', content: 'owned by A', timestamp: '2026-07-01T12:00:00.000Z' }),
       ]);
@@ -388,6 +625,22 @@ function testFilterMatrix() {
     () => harness.test.compileFilters({ ...base, text: '[', regex: true }),
     /Invalid regular expression/,
   );
+
+  const oldCandidate = {
+    ...candidate,
+    timestamp: '2020-01-01T00:00:00.000Z',
+  };
+  assert.equal(
+    harness.test.matchesMessage(
+      oldCandidate,
+      { ...base, minMessageAgeHours: 1 },
+      null,
+      [],
+      new Date('2020-01-01T02:00:00.000Z').getTime(),
+    ),
+    true,
+    'age filtering should use the dry-run reference time instead of wall-clock drift',
+  );
 }
 
 function testQueueOrderingAndConfigValidation() {
@@ -429,6 +682,30 @@ function testQueueOrderingAndConfigValidation() {
   );
 }
 
+function testInvalidRequestClassificationAndWindowPruning() {
+  const harness = makeHarness({ maxInvalidRequestsPer10Minutes: 2 });
+  harness.test.setRunState({
+    ...harness.test.emptyRunState(),
+    config: { ...harness.prefs, maxInvalidRequestsPer10Minutes: 2 },
+    invalidRequestTimes: [Date.now() - (11 * 60 * 1000)],
+  });
+
+  assert.deepEqual(
+    { ...harness.test.recordInvalidRequest(429, 'shared') },
+    { count: 0, tripped: false },
+    'shared-resource 429 responses do not count toward Discord invalid requests',
+  );
+  assert.deepEqual(
+    { ...harness.test.recordInvalidRequest(403) },
+    { count: 1, tripped: false },
+    'expired timestamps should be pruned from the rolling window',
+  );
+  assert.deepEqual(
+    { ...harness.test.recordInvalidRequest(429, 'user') },
+    { count: 2, tripped: true },
+  );
+}
+
 async function testMalformedHistoryCursorFailsClosed() {
   const harness = makeHarness();
   harness.setFetchHandler(async ({ url, method }) => {
@@ -453,11 +730,56 @@ async function testMalformedHistoryCursorFailsClosed() {
   assert.equal(state.queue.length, 0);
 }
 
+async function testOutOfOrderHistoryFailsClosed() {
+  const harness = makeHarness();
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response([
+        message({ id: '100', timestamp: '2026-07-01T00:00:00.000Z' }),
+        message({ id: '200', timestamp: '2026-07-02T00:00:00.000Z' }),
+      ]);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'paused');
+  assert.equal(state.operation, 'scanning');
+  assert.equal(state.queue.length, 0, 'an invalid page must never partially populate the queue');
+}
+
+async function testCrossChannelHistoryFailsClosed() {
+  const harness = makeHarness();
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      return response([
+        message({
+          id: '350',
+          timestamp: '2026-07-03T00:00:00.000Z',
+          channelId: '999999999999999999',
+        }),
+      ]);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  const state = harness.test.getRunState();
+  assert.equal(state.status, 'paused');
+  assert.equal(state.queue.length, 0);
+}
+
 async function testCorruptedQueueFailsClosed() {
   const harness = makeHarness();
   harness.setFetchHandler(async ({ url, method }) => {
     if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
       return response([
         message({ id: '850', content: 'owned', timestamp: '2026-07-01T12:00:00.000Z' }),
       ]);
@@ -469,7 +791,7 @@ async function testCorruptedQueueFailsClosed() {
   harness.test.acceptToken(TOKEN_A);
   await harness.test.startScan();
   const state = harness.test.getRunState();
-  state.queue[0].channelId = '999999999999999999';
+  state.queue[0].id = '851';
   await harness.test.startDelete();
 
   assert.equal(state.status, 'scanned');
@@ -481,11 +803,12 @@ async function testCorruptedQueueFailsClosed() {
 }
 
 async function testRateLimitRecoveryWaits() {
-  const harness = makeHarness();
+  const harness = makeHarness({ baseDeleteDelayMs: 1000 });
   let deleteAttempts = 0;
   harness.setFetchHandler(async ({ url, method }) => {
     if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
       return response([
         message({ id: '700', content: 'rate limited', timestamp: '2026-07-01T12:00:00.000Z' }),
       ]);
@@ -519,7 +842,12 @@ async function testRateLimitRecoveryWaits() {
   assert.equal(deleteAttempts, 2);
   assert.equal(state.status, 'complete');
   assert.equal(state.rateLimits, 1);
-  assert.ok(elapsed >= 1000, `Retry-After minimum was not respected (${elapsed}ms).`);
+  assert.ok(
+    elapsed >= 1500,
+    `adaptive fallback must extend an unrealistically short Retry-After (${elapsed}ms).`,
+  );
+  assert.ok(state.learnedDeleteDelayMs >= 1500);
+  assert.ok(state.rateLimitUntil > 0);
 }
 
 async function testFatalAuthenticationStopsImmediately() {
@@ -528,6 +856,7 @@ async function testFatalAuthenticationStopsImmediately() {
   harness.setFetchHandler(async ({ url, method }) => {
     if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
     if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
       return response([
         message({ id: '900', content: 'auth failure', timestamp: '2026-07-01T12:00:00.000Z' }),
       ]);
@@ -549,18 +878,67 @@ async function testFatalAuthenticationStopsImmediately() {
   assert.equal(state.queue.length, 1);
 }
 
+async function testInvalidRequestCircuitBreakerSurvivesMixedSuccess() {
+  const harness = makeHarness({
+    maxInvalidRequestsPer10Minutes: 2,
+    stopAfterErrors: 10,
+  });
+  harness.setFetchHandler(async ({ url, method }) => {
+    if (method === 'GET' && url.endsWith('/users/@me')) return response(USER_A);
+    if (method === 'GET' && url.includes(`/channels/${TARGET_CHANNEL}/messages?`)) {
+      if (historyBefore(url)) return response([]);
+      return response([
+        message({ id: '300', timestamp: '2026-07-03T00:00:00.000Z' }),
+        message({ id: '200', timestamp: '2026-07-02T00:00:00.000Z' }),
+        message({ id: '100', timestamp: '2026-07-01T00:00:00.000Z' }),
+      ]);
+    }
+    if (method === 'DELETE' && url.endsWith('/messages/100')) {
+      return response({ message: 'Cannot delete this entry.' }, 403);
+    }
+    if (method === 'DELETE' && url.endsWith('/messages/200')) return response(null, 204);
+    if (method === 'DELETE' && url.endsWith('/messages/300')) {
+      return response({ message: 'Cannot delete this entry.' }, 403);
+    }
+    throw new Error(`Unexpected ${method} ${url}`);
+  });
+
+  harness.test.acceptToken(TOKEN_A);
+  await harness.test.startScan();
+  await harness.test.startDelete();
+  const state = harness.test.getRunState();
+
+  assert.equal(state.status, 'paused');
+  assert.deepEqual(
+    Array.from(state.queue, (item) => item.id),
+    ['300'],
+    'the threshold request must remain queued for later review',
+  );
+  assert.equal(state.invalidRequestTimes.length, 2);
+}
+
 async function main() {
   await testCredentialSnifferIgnoresThirdParties();
   await testApiAllowlistBindsMethodPathAndBody();
   await testCappedScanAndDelete();
+  await testShortPagesContinueUntilConfirmedEmpty();
+  await testTransientEmptyPageDoesNotEndScan();
+  await testNewScanIgnoresStaleCheckpointTarget();
+  await testFailedScanPreflightPreservesExistingCheckpoint();
+  await testOldestCapBoundsWorkingQueue();
   await testCompactCheckpointRestoresLockedChannel();
+  await testPersistedCooldownSurvivesReload();
   testFilterMatrix();
   testQueueOrderingAndConfigValidation();
+  testInvalidRequestClassificationAndWindowPruning();
   await testMalformedHistoryCursorFailsClosed();
+  await testOutOfOrderHistoryFailsClosed();
+  await testCrossChannelHistoryFailsClosed();
   await testAccountSwitchFailsClosed();
   await testCorruptedQueueFailsClosed();
   await testRateLimitRecoveryWaits();
   await testFatalAuthenticationStopsImmediately();
+  await testInvalidRequestCircuitBreakerSurvivesMixedSuccess();
   console.log('Userscript scan/delete integration tests passed.');
 }
 

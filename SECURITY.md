@@ -26,6 +26,7 @@ Changes should be rejected if they introduce any of the following without an exp
 - Deletion without author-ID verification.
 - Server-wide, multi-channel, or all-DM deletion scope.
 - Removal of the dry run, target lock, or typed confirmation.
+- Removal of queue-integrity, strict history-ordering, or invalid-request circuit checks.
 - Retrying HTTP 429 before Discord's `Retry-After` period has elapsed.
 
 Run `npm test` before every release.

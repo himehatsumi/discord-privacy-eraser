@@ -47,6 +47,8 @@ A checkpoint may contain:
 - The signed-in user ID.
 - Queued message IDs and timestamps.
 - Progress counters and failed message IDs.
+- A non-cryptographic queue-integrity checksum.
+- Rate-limit deadlines, learned pacing, and recent invalid-request timestamps.
 
 It does not contain message content, attachment URLs, cookies, the authorization token, or activity-log text.
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Privacy Eraser (Current Channel / DM)
 // @namespace    local.codex.discord-privacy-eraser
-// @version      1.1.0
+// @version      1.2.0
 // @description  Preview, filter, and delete only your own messages in the currently open Discord channel or DM.
 // @author       Codex
 // @match        https://discord.com/channels/*
@@ -35,12 +35,13 @@
 
   const SCRIPT = Object.freeze({
     name: 'Discord Privacy Eraser',
-    version: '1.1.0',
+    version: '1.2.0',
     prefsKey: 'dpe:prefs:v1',
     runKey: 'dpe:run:v1',
     apiVersions: ['10', '9'],
     maxLogLines: 180,
     maxSavedFailures: 2000,
+    invalidRequestWindowMs: 10 * 60 * 1000,
   });
 
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -71,6 +72,8 @@
     nextAllowedAt: 0,
     startedAt: 0,
     requestController: null,
+    activeTarget: null,
+    preflight: false,
     logs: [],
   };
 
@@ -110,6 +113,8 @@
     maxRetries: 12,
     stopAfterErrors: 5,
     checkpointEvery: 50,
+    emptyPageConfirmations: 2,
+    maxInvalidRequestsPer10Minutes: 20,
     pauseOnNavigate: true,
     autoResume: false,
     riskAccepted: false,
@@ -360,6 +365,7 @@
       signature: '',
       config: null,
       queue: [],
+      queueDigest: '',
       failures: [],
       scanCursor: '',
       scannedPages: 0,
@@ -373,6 +379,10 @@
       confirmed: false,
       firstTimestamp: '',
       lastTimestamp: '',
+      filterReferenceTime: 0,
+      rateLimitUntil: 0,
+      learnedDeleteDelayMs: 0,
+      invalidRequestTimes: [],
     };
   }
 
@@ -380,6 +390,18 @@
     const saved = storageGet(SCRIPT.runKey, null);
     if (!saved || saved.version !== 1 || !Array.isArray(saved.queue)) return emptyRunState();
     const targetChannelId = String(saved.target?.channelId || '');
+    let config = saved.config;
+    let signature = saved.signature;
+    const addedConfigDefaults = {};
+    for (const field of ['emptyPageConfirmations', 'maxInvalidRequestsPer10Minutes']) {
+      if (config && config[field] === undefined) {
+        addedConfigDefaults[field] = defaultPrefs[field];
+      }
+    }
+    if (config && Object.keys(addedConfigDefaults).length > 0) {
+      config = { ...config, ...addedConfigDefaults };
+      signature = configSignature(config, saved.target, saved.userId);
+    }
     const unpack = (item) => {
       if (!Array.isArray(item)) return item;
       return {
@@ -388,20 +410,81 @@
         timestamp: String(item[1] || ''),
       };
     };
-    return {
+    const loaded = {
       ...emptyRunState(),
       ...saved,
+      config,
+      signature,
+      filterReferenceTime: Number.isFinite(saved.filterReferenceTime)
+        ? saved.filterReferenceTime
+        : (Number.isFinite(saved.savedAt) ? saved.savedAt : 0),
       queue: saved.queue.map(unpack).filter((item) => item?.id),
       failures: Array.isArray(saved.failures)
         ? saved.failures.map(unpack).filter((item) => item?.id)
         : [],
+      invalidRequestTimes: Array.isArray(saved.invalidRequestTimes)
+        ? saved.invalidRequestTimes
+          .filter((time) => Number.isFinite(time) && time > Date.now() - SCRIPT.invalidRequestWindowMs)
+          .slice(-1000)
+        : [],
     };
+    if (!loaded.queueDigest && loaded.queue.length > 0) {
+      loaded.queueDigest = computeQueueDigest(
+        loaded.queue,
+        loaded.target,
+        loaded.userId,
+        loaded.signature,
+      );
+    }
+    return loaded;
   }
 
   let runState = loadRunState();
 
+  function restorePersistedPacing(config = runState.config || defaultPrefs) {
+    const configuredBase = Number(config?.baseDeleteDelayMs);
+    const configuredMax = Number(config?.maxAdaptiveDelayMs);
+    const baseDelay = Number.isFinite(configuredBase)
+      ? configuredBase
+      : defaultPrefs.baseDeleteDelayMs;
+    const maximumDelay = Number.isFinite(configuredMax) && configuredMax >= baseDelay
+      ? configuredMax
+      : Math.max(baseDelay, defaultPrefs.maxAdaptiveDelayMs);
+    const learnedDelay = Number(runState.learnedDeleteDelayMs);
+    runtime.adaptiveDeleteDelayMs = clamp(
+      Math.max(
+        baseDelay,
+        runtime.adaptiveDeleteDelayMs || 0,
+        Number.isFinite(learnedDelay) ? learnedDelay : 0,
+      ),
+      baseDelay,
+      maximumDelay,
+    );
+    const savedDeadline = Number(runState.rateLimitUntil);
+    if (Number.isFinite(savedDeadline) && savedDeadline > Date.now()) {
+      runtime.nextAllowedAt = Math.max(runtime.nextAllowedAt, savedDeadline);
+    }
+  }
+
+  restorePersistedPacing();
+
   function saveRunState() {
     runState.savedAt = Date.now();
+    runState.queueDigest = runState.queue.length > 0
+      ? computeQueueDigest(runState.queue, runState.target, runState.userId, runState.signature)
+      : '';
+    runState.rateLimitUntil = Math.max(
+      Number.isFinite(runState.rateLimitUntil) ? runState.rateLimitUntil : 0,
+      Number.isFinite(runtime.nextAllowedAt) ? runtime.nextAllowedAt : 0,
+    );
+    if (runtime.adaptiveDeleteDelayMs > 0) {
+      runState.learnedDeleteDelayMs = Math.max(
+        Number.isFinite(runState.learnedDeleteDelayMs)
+          ? runState.learnedDeleteDelayMs
+          : 0,
+        runtime.adaptiveDeleteDelayMs,
+      );
+    }
     // The channel is already locked in runState.target, so repeating it for every
     // queued item would waste several megabytes in very long conversations.
     const pack = (item) => [String(item.id), String(item.timestamp || '')];
@@ -476,6 +559,18 @@
     return fnv1a(JSON.stringify({ config, target, userId }));
   }
 
+  function computeQueueDigest(queue, target, userId, signature) {
+    return fnv1a(JSON.stringify({
+      channelId: String(target?.channelId || ''),
+      userId: String(userId || ''),
+      signature: String(signature || ''),
+      items: queue.map((item) => [
+        String(item?.id || ''),
+        String(item?.timestamp || ''),
+      ]),
+    }));
+  }
+
   function jitter(ms, percent) {
     if (ms <= 0 || percent <= 0) return Math.max(0, ms);
     const spread = ms * (percent / 100);
@@ -504,11 +599,12 @@
     if (runtime.stopped) throw new StopSignal();
 
     const currentTarget = parseTarget();
+    const lockedTarget = runtime.activeTarget || runState.target;
     if (
       runtime.mode !== 'idle'
       && runState.config?.pauseOnNavigate
-      && runState.target
-      && !sameTarget(currentTarget, runState.target)
+      && lockedTarget
+      && !sameTarget(currentTarget, lockedTarget)
       && !runtime.paused
     ) {
       runtime.paused = true;
@@ -575,6 +671,30 @@
     return Math.ceil(seconds * 1000);
   }
 
+  function recordInvalidRequest(status, scope = '') {
+    if (![401, 403, 429].includes(status)) return { count: 0, tripped: false };
+    if (status === 429 && scope === 'shared') return { count: 0, tripped: false };
+    const now = Date.now();
+    const cutoff = now - SCRIPT.invalidRequestWindowMs;
+    const recent = Array.isArray(runState.invalidRequestTimes)
+      ? runState.invalidRequestTimes.filter((time) => Number.isFinite(time) && time > cutoff)
+      : [];
+    recent.push(now);
+    runState.invalidRequestTimes = recent;
+    const limit = runState.config?.maxInvalidRequestsPer10Minutes
+      || defaultPrefs.maxInvalidRequestsPer10Minutes;
+    return {
+      count: recent.length,
+      tripped: recent.length >= limit,
+    };
+  }
+
+  function invalidRequestCircuitError(count) {
+    return new FatalApiError(
+      `Paused after ${count} counted 401/403/429 responses within 10 minutes to avoid Discord's invalid-request restriction.`,
+    );
+  }
+
   function learnRateLimitHeaders(response, method) {
     const remainingRaw = response.headers.get('X-RateLimit-Remaining');
     const resetAfterRaw = response.headers.get('X-RateLimit-Reset-After');
@@ -585,11 +705,18 @@
 
     const resetMs = Math.ceil(resetAfterSeconds * 1000);
     if (remaining === 0) {
-      runtime.nextAllowedAt = Math.max(runtime.nextAllowedAt, Date.now() + resetMs + 150);
+      const deadline = Date.now() + resetMs + 150;
+      runtime.nextAllowedAt = Math.max(runtime.nextAllowedAt, deadline);
+      runState.rateLimitUntil = Math.max(runState.rateLimitUntil || 0, deadline);
     }
     if (method === 'DELETE' && Number.isFinite(remaining) && remaining > 0) {
       runtime.headerDeleteDelayMs = Math.ceil((resetMs / (remaining + 0.5)) * 1.15);
+      runState.learnedDeleteDelayMs = Math.max(
+        runState.learnedDeleteDelayMs || 0,
+        runtime.headerDeleteDelayMs,
+      );
     }
+    if (remaining === 0) saveRunState();
   }
 
   async function apiRequest(path, options = {}) {
@@ -667,7 +794,7 @@
 
       if (response.status === 429) {
         const payload = await responseJson(response);
-        const minimumWait = Math.max(1000, retryAfterMs(response, payload));
+        const advertisedWait = retryAfterMs(response, payload);
         runState.rateLimits += 1;
         runtime.successesSinceLimit = 0;
         runtime.adaptiveDeleteDelayMs = clamp(
@@ -678,13 +805,33 @@
           runState.config?.baseDeleteDelayMs || defaultPrefs.baseDeleteDelayMs,
           runState.config?.maxAdaptiveDelayMs || defaultPrefs.maxAdaptiveDelayMs,
         );
-        saveRunState();
-        const scope = response.headers.get('X-RateLimit-Scope') || (payload?.global ? 'global' : 'route');
-        log('rate', `Discord rate-limited the ${purpose} (${scope}); respecting Retry-After for ${formatDuration(minimumWait)}.`);
+        runState.learnedDeleteDelayMs = Math.max(
+          runState.learnedDeleteDelayMs || 0,
+          runtime.adaptiveDeleteDelayMs,
+        );
+        const minimumWait = Math.max(
+          1000,
+          advertisedWait,
+          runtime.adaptiveDeleteDelayMs,
+        );
+        const scope = String(
+          response.headers.get('X-RateLimit-Scope')
+          || (payload?.global ? 'global' : 'route'),
+        ).toLowerCase();
         // Retry-After is a hard minimum. Add only positive jitter so a large
         // rate-limit window can never be shortened by random pacing.
         const positiveJitter = Math.round(Math.random() * Math.min(1000, minimumWait * 0.05));
-        await interruptibleSleep(minimumWait + 250 + positiveJitter);
+        const waitMs = minimumWait + 250 + positiveJitter;
+        const deadline = Date.now() + waitMs;
+        runtime.nextAllowedAt = Math.max(runtime.nextAllowedAt, deadline);
+        runState.rateLimitUntil = Math.max(runState.rateLimitUntil || 0, deadline);
+        const invalidRequests = recordInvalidRequest(429, scope);
+        saveRunState();
+        if (invalidRequests.tripped) {
+          throw invalidRequestCircuitError(invalidRequests.count);
+        }
+        log('rate', `Discord rate-limited the ${purpose} (${scope}); cooling down for ${formatDuration(waitMs)}.`);
+        await interruptibleSleep(waitMs);
         continue;
       }
 
@@ -698,6 +845,8 @@
       }
 
       if (response.status === 401) {
+        recordInvalidRequest(401);
+        saveRunState();
         authToken = '';
         currentUser = null;
         updateAuthStatus();
@@ -705,6 +854,14 @@
           'Discord rejected the session (401). The run was paused; refresh Discord and resume.',
           401,
         );
+      }
+
+      if (response.status === 403) {
+        const invalidRequests = recordInvalidRequest(403);
+        saveRunState();
+        if (invalidRequests.tripped) {
+          throw invalidRequestCircuitError(invalidRequests.count);
+        }
       }
 
       return response;
@@ -757,7 +914,13 @@
       || /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(filename);
   }
 
-  function matchesMessage(message, config, compiledRegex, excludedTerms) {
+  function matchesMessage(
+    message,
+    config,
+    compiledRegex,
+    excludedTerms,
+    referenceTime = Date.now(),
+  ) {
     if (!message?.author?.id || message.author.id !== currentUser.id) return false;
     if (!config.includePinned && message.pinned) return false;
     if (!config.includeEdited && message.edited_timestamp) return false;
@@ -767,7 +930,8 @@
     if (config.afterDate && timestamp < new Date(config.afterDate).getTime()) return false;
     if (config.beforeDate && timestamp > new Date(config.beforeDate).getTime()) return false;
     if (config.minMessageAgeHours > 0) {
-      const newestAllowed = Date.now() - (config.minMessageAgeHours * 60 * 60 * 1000);
+      const stableReferenceTime = Number.isFinite(referenceTime) ? referenceTime : Date.now();
+      const newestAllowed = stableReferenceTime - (config.minMessageAgeHours * 60 * 60 * 1000);
       if (timestamp > newestAllowed) return false;
     }
 
@@ -846,6 +1010,8 @@
       maxRetries: [1, 50],
       stopAfterErrors: [1, 100],
       checkpointEvery: [1, 100],
+      emptyPageConfirmations: [1, 5],
+      maxInvalidRequestsPer10Minutes: [2, 1000],
     };
     for (const [field, [minimum, maximum]] of Object.entries(integerRanges)) {
       if (
@@ -903,6 +1069,35 @@
     return /^\d{1,20}$/.test(String(value || ''));
   }
 
+  function validateHistoryPage(messages, target, before) {
+    if (!Array.isArray(messages)) {
+      throw new FatalApiError('Discord returned a non-array history response. The scan was paused safely.');
+    }
+    if (messages.length > 100) {
+      throw new FatalApiError('Discord returned an oversized history page. The scan was paused safely.');
+    }
+    let previousId = before ? BigInt(before) : null;
+    for (const message of messages) {
+      if (
+        !isSnowflake(message?.id)
+        || String(message?.channel_id || '') !== String(target.channelId)
+        || !Number.isFinite(new Date(message?.timestamp).getTime())
+      ) {
+        throw new FatalApiError(
+          'Discord returned a malformed history item or one outside the locked target.',
+        );
+      }
+      const currentId = BigInt(message.id);
+      if (previousId !== null && currentId >= previousId) {
+        throw new FatalApiError(
+          'Discord returned duplicate or out-of-order history. The scan was paused safely.',
+        );
+      }
+      previousId = currentId;
+    }
+    return messages.length ? String(messages[messages.length - 1].id) : '';
+  }
+
   function prepareQueue(queue, config) {
     const deduplicated = [...new Map(queue.map((item) => [item.id, item])).values()];
     deduplicated.sort(snowflakeCompare);
@@ -942,6 +1137,16 @@
     ));
   }
 
+  function validateQueueIntegrity(state, target) {
+    if (!state.queueDigest || !validateQueueTarget(state.queue, target)) return false;
+    return state.queueDigest === computeQueueDigest(
+      state.queue,
+      target,
+      state.userId,
+      state.signature,
+    );
+  }
+
   function readConfigFromUi() {
     if (!shadow) return loadPrefs();
     const value = (id) => shadow.getElementById(id)?.value ?? '';
@@ -967,6 +1172,8 @@
       maxRetries: integer(value('dpe-retries'), 12, 1, 50),
       stopAfterErrors: integer(value('dpe-error-stop'), 5, 1, 100),
       checkpointEvery: integer(value('dpe-checkpoint'), 10, 1, 100),
+      emptyPageConfirmations: integer(value('dpe-empty-confirmations'), 2, 1, 5),
+      maxInvalidRequestsPer10Minutes: integer(value('dpe-invalid-limit'), 20, 2, 1000),
       pauseOnNavigate: checked('dpe-pause-nav'),
       autoResume: checked('dpe-auto-resume'),
       riskAccepted: checked('dpe-risk'),
@@ -1003,6 +1210,8 @@
     setValue('dpe-retries', prefs.maxRetries);
     setValue('dpe-error-stop', prefs.stopAfterErrors);
     setValue('dpe-checkpoint', prefs.checkpointEvery);
+    setValue('dpe-empty-confirmations', prefs.emptyPageConfirmations);
+    setValue('dpe-invalid-limit', prefs.maxInvalidRequestsPer10Minutes);
     setChecked('dpe-pause-nav', prefs.pauseOnNavigate);
     setChecked('dpe-auto-resume', prefs.autoResume);
     setChecked('dpe-risk', prefs.riskAccepted);
@@ -1029,6 +1238,8 @@
     runtime.stopped = false;
     runtime.pauseReason = '';
     runtime.startedAt = Date.now();
+    runtime.activeTarget = target;
+    runtime.preflight = true;
     updateUi();
 
     try {
@@ -1054,17 +1265,23 @@
           userId: user.id,
           signature,
           config,
+          filterReferenceTime: runtime.startedAt,
         };
       } else {
         runState.status = 'scanning';
+        if (!Number.isFinite(runState.filterReferenceTime) || runState.filterReferenceTime <= 0) {
+          runState.filterReferenceTime = runState.savedAt || runtime.startedAt;
+        }
         log('info', `Resuming scan before message ${runState.scanCursor || 'latest'}.`);
       }
+      runtime.preflight = false;
 
       savePrefs(config);
       saveRunState();
       const { compiledRegex, excludedTerms } = compileFilters(config);
       let before = canResume ? runState.scanCursor : '';
       let reachedDateFloor = false;
+      let consecutiveEmptyPages = 0;
 
       log(
         'info',
@@ -1089,19 +1306,29 @@
         }
 
         const messages = await response.json();
-        if (!Array.isArray(messages) || messages.length === 0) break;
+        const nextBefore = validateHistoryPage(messages, target, before);
+        if (messages.length === 0) {
+          consecutiveEmptyPages += 1;
+          if (consecutiveEmptyPages >= config.emptyPageConfirmations) break;
+          log(
+            'warn',
+            `History returned an empty page; confirming end-of-history (${consecutiveEmptyPages}/${config.emptyPageConfirmations}).`,
+          );
+          await interruptibleSleep(jitter(config.scanDelayMs, config.jitterPercent));
+          continue;
+        }
+        consecutiveEmptyPages = 0;
         runState.scannedPages += 1;
         runState.scannedMessages += messages.length;
 
         for (const message of messages) {
-          if (
-            !isSnowflake(message?.id)
-            || String(message?.channel_id || '') !== String(target.channelId)
-          ) {
-            log('warn', 'Ignored a malformed history item or one outside the locked target.');
-            continue;
-          }
-          if (matchesMessage(message, config, compiledRegex, excludedTerms)) {
+          if (matchesMessage(
+            message,
+            config,
+            compiledRegex,
+            excludedTerms,
+            runState.filterReferenceTime,
+          )) {
             runState.queue.push({
               id: String(message.id),
               channelId: String(target.channelId),
@@ -1113,16 +1340,15 @@
           }
         }
 
-        const oldest = messages[messages.length - 1];
-        const nextBefore = String(oldest?.id || '');
         if (
-          !isSnowflake(nextBefore)
-          || (before && BigInt(nextBefore) >= BigInt(before))
+          config.deleteOrder === 'oldest'
+          && config.maxMessages > 0
+          && runState.queue.length > config.maxMessages
         ) {
-          throw new FatalApiError(
-            'Discord returned an invalid or repeating history cursor. The scan was paused safely.',
-          );
+          runState.queue = prepareQueue(runState.queue, config);
         }
+
+        const oldest = messages[messages.length - 1];
         before = nextBefore;
         runState.scanCursor = before;
         if (config.afterDate) {
@@ -1136,7 +1362,7 @@
           `Scanned ${runState.scannedMessages.toLocaleString()} messages; ${runState.matchedMessages.toLocaleString()} match so far.`,
         );
 
-        if (messages.length < 100) break;
+        if (reachedDateFloor) break;
         if (
           config.deleteOrder === 'newest'
           && config.maxMessages > 0
@@ -1163,9 +1389,11 @@
       if (error instanceof StopSignal) {
         log('info', 'Scan stopped. Its checkpoint was preserved.');
       } else {
-        runState.status = 'paused';
-        runState.operation = 'scanning';
-        saveRunState();
+        if (!runtime.preflight) {
+          runState.status = 'paused';
+          runState.operation = 'scanning';
+          saveRunState();
+        }
         log('error', error.message || String(error));
       }
     } finally {
@@ -1173,6 +1401,8 @@
       runtime.paused = false;
       runtime.stopped = false;
       runtime.pauseReason = '';
+      runtime.activeTarget = null;
+      runtime.preflight = false;
       abortActiveRequest();
       updateUi();
     }
@@ -1180,11 +1410,12 @@
 
   async function confirmDeletion() {
     const count = runState.queue.length;
-    const phrase = `DELETE ${count}`;
+    const phrase = `DELETE ${count} FROM ${runState.target.channelId}`;
     const entered = pageWindow.prompt(
       [
         `This permanently deletes ${count.toLocaleString()} messages authored by your account`,
         `from ${formatTarget(runState.target)}.`,
+        `Matched range: ${formatDate(runState.lastTimestamp)} → ${formatDate(runState.firstTimestamp)}.`,
         '',
         'Deleted messages cannot be recovered.',
         `Type exactly: ${phrase}`,
@@ -1221,13 +1452,14 @@
       log('error', 'Return to the exact channel/DM used for the dry run before deleting.');
       return;
     }
-    if (!validateQueueTarget(runState.queue, target)) {
-      log('error', 'The saved queue failed its locked-channel integrity check. Run a new dry scan.');
+    if (!validateQueueIntegrity(runState, target)) {
+      log('error', 'The saved queue failed its channel or checksum integrity check. Run a new dry scan.');
       return;
     }
 
     try {
       validateConfig(config);
+      restorePersistedPacing(config);
       const user = await resolveCurrentUser({ force: true });
       const expectedSignature = configSignature(config, target, user.id);
       if (runState.signature !== expectedSignature || runState.userId !== user.id) {
@@ -1251,7 +1483,8 @@
     runtime.stopped = false;
     runtime.pauseReason = '';
     runtime.startedAt = Date.now();
-    runtime.adaptiveDeleteDelayMs = config.baseDeleteDelayMs;
+    runtime.activeTarget = target;
+    restorePersistedPacing(config);
     runtime.headerDeleteDelayMs = 0;
     runtime.successesSinceLimit = 0;
     runState.status = 'deleting';
@@ -1309,6 +1542,10 @@
             runtime.adaptiveDeleteDelayMs = Math.max(
               config.baseDeleteDelayMs,
               Math.round(runtime.adaptiveDeleteDelayMs * 0.9),
+            );
+            runState.learnedDeleteDelayMs = Math.max(
+              runtime.adaptiveDeleteDelayMs,
+              runtime.headerDeleteDelayMs,
             );
             runtime.successesSinceLimit = 0;
           }
@@ -1375,6 +1612,7 @@
       runtime.paused = false;
       runtime.stopped = false;
       runtime.pauseReason = '';
+      runtime.activeTarget = null;
       abortActiveRequest();
       updateUi();
     }
@@ -1424,6 +1662,14 @@
         saveRunState();
         log('info', 'Checkpoint marked as stopped; it remains available for manual resume.');
       }
+      return;
+    }
+    if (runtime.preflight) {
+      runtime.stopped = true;
+      runtime.paused = false;
+      abortActiveRequest();
+      wakeRuntime();
+      log('info', 'Stopped before the existing checkpoint was changed.');
       return;
     }
     runtime.stopped = true;
@@ -1805,6 +2051,8 @@
                 <label class="field"><span>Network / 5xx retries</span><input id="dpe-retries" type="number" min="1" max="50"></label>
                 <label class="field"><span>Pause after consecutive errors</span><input id="dpe-error-stop" type="number" min="1" max="100"></label>
                 <label class="field"><span>Checkpoint every N deletes</span><input id="dpe-checkpoint" type="number" min="1" max="100"></label>
+                <label class="field"><span>Confirm empty history pages</span><input id="dpe-empty-confirmations" type="number" min="1" max="5"></label>
+                <label class="field"><span>Invalid requests / 10 min before pause</span><input id="dpe-invalid-limit" type="number" min="2" max="1000"></label>
                 <label class="check"><input id="dpe-pause-nav" type="checkbox"> Pause if I navigate away</label>
                 <label class="check full"><input id="dpe-auto-resume" type="checkbox"> Auto-resume an interrupted confirmed deletion after reload (10-second grace period)</label>
               </div>
@@ -1856,7 +2104,9 @@
 
   function scheduleAutoResume() {
     if (
-      !runState.config?.autoResume
+      autoResumeTimer
+      || runtime.mode !== 'idle'
+      || !runState.config?.autoResume
       || runState.status !== 'deleting'
       || runState.operation !== 'deleting'
       || !runState.confirmed
@@ -1884,8 +2134,17 @@
     updateUi();
   }
 
+  function ensureUiMounted() {
+    if (rootHost && !rootHost.isConnected) {
+      rootHost = null;
+      shadow = null;
+    }
+    if (!rootHost && document.body) mountUi();
+  }
+
   function watchNavigation() {
     setInterval(() => {
+      ensureUiMounted();
       if (location.href === lastKnownUrl) return;
       lastKnownUrl = location.href;
       updateUi();

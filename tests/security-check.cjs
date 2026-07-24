@@ -22,16 +22,21 @@ for (const [label, pattern] of forbidden) {
 const required = [
   ['same-origin API construction', /\$\{location\.origin\}\/api\/v\$\{apiVersion\}\$\{path\}/],
   ['author identity gate', /message\.author\.id !== currentUser\.id/],
-  ['typed confirmation', /const phrase = `DELETE \$\{count\}`/],
+  ['target-bound typed confirmation', /const phrase = `DELETE \$\{count\} FROM \$\{runState\.target\.channelId\}`/],
   ['429 handling', /response\.status === 429/],
   ['Retry-After handling', /headers\.get\('Retry-After'\)/],
   ['Retry-After hard minimum', /minimumWait \+ 250 \+ positiveJitter/],
   ['dry-run target lock', /runState\.signature !== expectedSignature/],
   ['fresh identity verification', /resolveCurrentUser\(\{ force: true \}\)/],
   ['mid-run account-switch stop', /The signed-in Discord account changed/],
-  ['locked-channel queue validation', /validateQueueTarget\(runState\.queue, target\)/],
+  ['locked-channel queue validation', /validateQueueIntegrity\(runState, target\)/],
+  ['queue checksum', /computeQueueDigest/],
   ['unexpected API request block', /Blocked an unexpected Discord API method, path, or body/],
   ['same-origin credential sniffing', /if \(isSameOriginDiscordApi\(args\[0\]\)\)/],
+  ['strict history ordering', /Discord returned duplicate or out-of-order history/],
+  ['persisted rate-limit cooldown', /runState\.rateLimitUntil/],
+  ['invalid-request circuit breaker', /invalidRequestCircuitError/],
+  ['removed-launcher remount', /rootHost && !rootHost\.isConnected/],
   ['no token persistence claim implemented', /token held only in memory/],
 ];
 
