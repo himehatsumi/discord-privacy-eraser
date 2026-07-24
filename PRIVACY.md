@@ -1,84 +1,31 @@
 # Privacy
 
-Discord Privacy Eraser is designed to keep account credentials and message data inside the Discord browser tab.
+Discord Privacy Eraser keeps its work inside the Discord browser tab.
 
-## Data read
+## Data it reads
 
-The userscript reads:
+- The current channel or DM ID
+- Your signed-in Discord account ID
+- Message history and author-filtered search results
+- Discord rate-limit information
+- The Discord session already held by the web client
 
-- The current Discord channel or DM ID from the browser URL.
-- The signed-in account ID from Discord's `/users/@me` API response.
-- Channel message history returned by Discord while a scan is running.
-- Author-filtered search hits used to anchor a fresh run and to jump past full 100-item windows with no deletable owned message, unless direct-history-only mode is selected.
-- Discord rate-limit response headers.
-- The existing in-memory authorization header used by the Discord web client.
+## Data it sends
 
-## Data sent
+Requests go only to the active Discord origin for:
 
-The script sends requests only to the same Discord origin on which it is running:
+- Account verification
+- Message search and history
+- Deleting queued messages
 
-- `GET /api/v9|v10/users/@me`
-- `GET /api/v9|v10/channels/{channel_id}/messages/search` for a DM/group DM, locked to the authenticated author ID
-- `GET /api/v9|v10/guilds/{guild_id}/messages/search` for a server channel, locked to the authenticated author and channel IDs
-- `GET /api/v9|v10/channels/{channel_id}/messages`
-- `DELETE /api/v9|v10/channels/{channel_id}/messages/{message_id}`
+The script has no telemetry, ads, remote dependencies, webhooks, or third-party requests. It does not download attachments.
 
-It has no telemetry, analytics, advertisements, webhooks, remote dependencies, update URL, or third-party network requests. The search and history requests stay on the active Discord origin. It does not fetch attachments.
+## Local data
 
-## Credential handling
+Your userscript manager stores preferences and recovery checkpoints. A checkpoint may include settings, Discord IDs, timestamps, counters, and queued message IDs.
 
-The Discord authorization token:
+Tokens, cookies, message text, attachments, and activity logs are not stored in checkpoints.
 
-- Is observed from the already authenticated Discord web client or its loaded modules.
-- Is held only in a JavaScript closure in memory.
-- Is never shown in the interface.
-- Is never written to userscript-manager storage, `localStorage`, a file, the clipboard, or a log.
-- Is never sent to any destination other than the same-origin Discord API.
+Matched-message and diagnostic logs stay in page memory. Diagnostics are copied only when you click **Copy diagnostics**.
 
-The source includes defensive token redaction for local log messages.
-
-## Local storage
-
-Preferences and recovery checkpoints are stored only using the userscript manager's private value storage. There is deliberately no page-readable `localStorage` fallback for settings or deletion queues. If private userscript storage is unavailable or full, the current run may continue in memory, but reload recovery is unavailable.
-
-Version 1.6 adds a queue-eligibility version. Checkpoints created before the documented message-type gate are ignored, preventing an older queue containing an authored call entry from being resumed for deletion. Preferences remain private and separate from run checkpoints.
-
-Version 1.6.2 starts private preferences generation v5 to make newest-first the fresh-run default. Active checkpoints retain their exact settings and order independently of this preference change.
-
-Version 1.6.3 standardizes the interface and documentation on “pre-deletion scan” terminology. This is a wording change only: the single-button workflow still reads a bounded queue from Discord, displays its matches, and requires confirmation before its first DELETE request.
-
-Version 1.1 also removes the two namespaced page-storage keys that version 1.0 could have created when private userscript storage was unavailable. It does not remove or modify Discord's own storage keys.
-
-A checkpoint may contain:
-
-- Filter and pacing settings.
-- The target guild/channel IDs.
-- The signed-in user ID.
-- Queued message IDs and timestamps.
-- Progress counters and failed message IDs.
-- The current batch number, scan cursor, batch capacity, and whether end-of-history was confirmed.
-- Whether the latest deletable owned-message anchor was found, whether search or direct history found it, and how many newer items were skipped by the direct-history fallback.
-- How many authored non-deletable call/system entries were ignored and how many sparse-window search jumps succeeded.
-- The queue-eligibility version that prevents pre-type-gate checkpoints from resuming.
-- A non-cryptographic queue-integrity checksum.
-- Rate-limit deadlines, learned pacing, and recent invalid-request timestamps.
-
-It does not contain message content, attachment URLs, cookies, the authorization token, or activity-log text.
-
-## Memory-only matched-message log
-
-During a live scan, the panel can display every filter match in the current batch as full text, a 300-character preview, timestamp/ID only, or not at all. Full text is the default so the bounded queue can be audited before deletion, including during the single-button cleanup flow.
-
-Those entries exist only in the userscript's current JavaScript memory and the panel's shadow DOM. They are cleared when the page is reloaded, the next batch starts, or the log is cleared. They are never included in preferences or checkpoints, written to a file or clipboard, or transmitted anywhere. After a reload, an interrupted checkpoint can resume safely, but message text found before the reload is intentionally not reconstructed or persisted.
-
-## Memory-only diagnostic log
-
-The technical trace covers scan and deletion troubleshooting. It contains response counts and status, confirmation outcomes, timestamps, hashed account/channel/message/cursor IDs, anonymized per-page author distributions, message-type counts, missing-author and webhook counts, pagination transitions, active filter categories, API version, rate-limit headers, and final counters.
-
-It deliberately omits message content, usernames, raw Discord IDs, authorization data, cookies, request headers, and the typed confirmation text. The trace is not added to preferences or checkpoints and disappears on reload. It is placed on the clipboard only after the user explicitly clicks **Copy diagnostics**; that copy is intended to be pasted into a private bug report.
-
-Use **Clear checkpoint** in the panel to erase saved run data. Removing the userscript through the userscript manager may also provide an option to remove its stored values.
-
-## Security boundary
-
-The script cannot protect data already copied, quoted, screenshotted, downloaded, cached, or retained for legal reasons. Discord describes its own retention behavior in its official support documentation.
+Use **Clear checkpoint** to remove saved run data.
