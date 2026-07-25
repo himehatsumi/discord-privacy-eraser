@@ -3,7 +3,7 @@
 // @namespace    local.codex.discord-privacy-eraser
 // @version      1.6.3
 // @description  Safely scan and delete only your own messages in the currently open Discord channel or DM.
-// @author       Codex
+// @author       hime
 // @match        https://discord.com/channels/*
 // @match        https://canary.discord.com/channels/*
 // @match        https://ptb.discord.com/channels/*
